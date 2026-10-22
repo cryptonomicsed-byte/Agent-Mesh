@@ -33,51 +33,9 @@ const SEED_CONTACTS: Contact[] = [
     state: 'online',
     addedAt: Date.now() - 3600000,
   },
-  {
-    name: 'Freifunk Mesh Gateway (Node #18)',
-    publicKey: 'a1f893d9b048123ef6177bc954e7d14872c05e19741b689a7702ec9432bfd12e',
-    addresses: ['192.168.1.1:10008', 'fe80::1:10008', 'gw.freifunk.mesh'],
-    state: 'online',
-    addedAt: Date.now() - 3600000 * 24 * 5,
-  },
-  {
-    name: 'Alice (Community Lab)',
-    publicKey: 'e7c10b428d9047bf8145a329de4100fc33829ad451996720b8f44d189ac3e041',
-    addresses: ['192.168.1.42:10008', 'fe80::a2b:3c4d:5e6f:7a8b'],
-    state: 'online',
-    addedAt: Date.now() - 3600000 * 24 * 3,
-  },
-  {
-    name: 'Bob (Mobile Walkie)',
-    publicKey: '7f9942a1bc34821d84e55198dc0045e76a38217bb4c90184e93d254aa18ef930',
-    addresses: ['192.168.1.77:10008'],
-    state: 'offline',
-    addedAt: Date.now() - 3600000 * 24,
-  },
 ];
 
-const SEED_EVENTS: CallEvent[] = [
-  {
-    id: 'evt-1',
-    contactPublicKey: 'e7c10b428d9047bf8145a329de4100fc33829ad451996720b8f44d189ac3e041',
-    contactName: 'Alice (Community Lab)',
-    type: 'incoming_accepted',
-    timestamp: Date.now() - 3600000 * 2,
-    duration: 142,
-    addressUsed: '192.168.1.42:10008',
-    hasVideo: true,
-  },
-  {
-    id: 'evt-2',
-    contactPublicKey: '7f9942a1bc34821d84e55198dc0045e76a38217bb4c90184e93d254aa18ef930',
-    contactName: 'Bob (Mobile Walkie)',
-    type: 'outgoing_missed',
-    timestamp: Date.now() - 3600000 * 18,
-    duration: 0,
-    addressUsed: '192.168.1.77:10008',
-    hasVideo: false,
-  },
-];
+const SEED_EVENTS: CallEvent[] = [];
 
 class StorageService {
   getSettings(): AppSettings {

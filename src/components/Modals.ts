@@ -1,6 +1,7 @@
 import { Contact, AppSettings } from '../types';
 import { renderQRToCanvas, scanCanvasForQR, scanImageFileForQR, parseContactPayload } from '../services/qr';
-import { formatFingerprint, generateRandomKey } from '../services/crypto';
+import { formatFingerprint, generateIdentityKeyPairSync, derivePublicKey } from '../services/crypto';
+import { nip19 } from 'nostr-tools';
 import { storage } from '../services/storage';
 import { audioSynth } from '../services/audioSynthesizer';
 
@@ -59,6 +60,7 @@ export function showMyQRModal(settings: AppSettings, onSaveAddresses: () => void
     name: settings.userName,
     publicKey: settings.publicKey,
     addresses: settings.activeAddresses,
+    relays: settings.nostrRelays,
   };
 
   renderQRToCanvas(canvas, myContact);
@@ -413,14 +415,33 @@ export function showSettingsModal(settings: AppSettings, onUpdated: () => void):
     </div>
 
     <div style="background: #151515; border: 1px solid #292929; border-radius: 10px; padding: 12px;">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-        <span style="font-size: 12px; font-weight: 600; color: #bbb;">Cryptographic Identity</span>
-        <button id="btn-regen-keys" style="font-size: 11px; color: #f87171; cursor: pointer;">Regenerate Identity</button>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+        <span style="font-size: 12px; font-weight: 600; color: #bbb;">Your Mesh Address</span>
+        <div style="display: flex; gap: 8px;">
+          <button id="btn-copy-npub" style="font-size: 11px; color: #4ade80; cursor: pointer;">Copy</button>
+          <button id="btn-regen-keys" style="font-size: 11px; color: #f87171; cursor: pointer;">New Identity</button>
+        </div>
       </div>
-      <div class="font-mono" style="font-size: 11px; color: #4ade80; word-break: break-all;">
+      <div style="font-size: 11px; color: #888; margin-bottom: 4px;">npub (share this so people can call you)</div>
+      <div id="npub-display" class="font-mono" style="font-size: 11px; color: #4ade80; word-break: break-all; background: #0d0d0d; padding: 8px; border-radius: 6px;">
+        ${nip19.npubEncode(settings.publicKey)}
+      </div>
+      <div style="font-size: 11px; color: #555; margin-top: 6px; font-family: monospace; word-break: break-all;">
         ${formatFingerprint(settings.publicKey)}
       </div>
-      <div style="font-size: 11px; color: #666; margin-top: 4px;">Used to encrypt signalling and verify identity on call connect.</div>
+    </div>
+
+    <div style="background: #151515; border: 1px solid #292929; border-radius: 10px; padding: 12px;">
+      <div style="font-size: 12px; font-weight: 600; color: #bbb; margin-bottom: 8px;">Import Identity (Restore from Another Device)</div>
+      <textarea id="import-privkey" rows="2" placeholder="Paste your 64-char hex private key or nsec1… here" style="
+        width: 100%; font-family: monospace; font-size: 11px; background: #0d0d0d;
+        border: 1px solid #333; border-radius: 6px; color: #fff; padding: 8px; resize: none;
+      "></textarea>
+      <button id="btn-import-identity" style="
+        margin-top: 6px; width: 100%; padding: 8px; background: #1e2d3d; color: #60a5fa;
+        border: 1px solid #1d4ed840; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer;
+      ">Import &amp; Replace Identity</button>
+      <div id="import-identity-error" style="font-size: 11px; color: #f87171; margin-top: 4px; display: none;"></div>
     </div>
 
     <div>
@@ -489,15 +510,52 @@ export function showSettingsModal(settings: AppSettings, onUpdated: () => void):
     }
   });
 
-  // Regenerate identity
+  // Copy npub
+  content.querySelector('#btn-copy-npub')?.addEventListener('click', () => {
+    const npub = nip19.npubEncode(settings.publicKey);
+    navigator.clipboard?.writeText(npub).then(() => {
+      const btn = content.querySelector('#btn-copy-npub') as HTMLElement;
+      if (btn) { btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = 'Copy', 1500); }
+    });
+  });
+
+  // Regenerate identity (proper secp256k1 keypair)
   content.querySelector('#btn-regen-keys')?.addEventListener('click', () => {
-    if (confirm('Generate a new cryptographic keypair? Existing contacts will need to rescan your QR code.')) {
-      settings.publicKey = generateRandomKey(32);
-      settings.privateKey = generateRandomKey(32);
+    if (confirm('Generate a brand-new identity? You will be unreachable on your old address — contacts will need to re-scan your QR code.')) {
+      const { publicKey, privateKey } = generateIdentityKeyPairSync();
+      settings.publicKey = publicKey;
+      settings.privateKey = privateKey;
       storage.saveSettings(settings);
       onUpdated();
       backdrop.remove();
       showSettingsModal(settings, onUpdated);
+    }
+  });
+
+  // Import identity
+  content.querySelector('#btn-import-identity')?.addEventListener('click', () => {
+    const raw = (content.querySelector('#import-privkey') as HTMLTextAreaElement).value.trim();
+    const errEl = content.querySelector('#import-identity-error') as HTMLElement;
+    errEl.style.display = 'none';
+    try {
+      let hexKey = raw;
+      if (raw.startsWith('nsec1')) {
+        const decoded = nip19.decode(raw);
+        if (decoded.type !== 'nsec') throw new Error('Not an nsec key');
+        hexKey = Array.from(decoded.data as Uint8Array).map(b => b.toString(16).padStart(2,'0')).join('');
+      }
+      if (!/^[0-9a-fA-F]{64}$/.test(hexKey)) throw new Error('Must be 64 hex chars or nsec1…');
+      const pubKey = derivePublicKey(hexKey);
+      settings.privateKey = hexKey.toLowerCase();
+      settings.publicKey = pubKey;
+      storage.saveSettings(settings);
+      onUpdated();
+      backdrop.remove();
+      alert('Identity imported! Your new address: ' + nip19.npubEncode(pubKey).slice(0, 20) + '…');
+      showSettingsModal(settings, onUpdated);
+    } catch (e: any) {
+      errEl.textContent = e?.message ?? 'Invalid key';
+      errEl.style.display = 'block';
     }
   });
 

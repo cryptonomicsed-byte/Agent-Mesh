@@ -1,11 +1,14 @@
 import { AppSettings } from '../types';
 import { formatFingerprint } from '../services/crypto';
+import { storage } from '../services/storage';
+import { nip19 } from 'nostr-tools';
 
 export function showLoginScreen(
   settings: AppSettings,
   onConnect: () => void,
   onOpenSettings: () => void,
 ): HTMLElement {
+  const isFirstRun = settings.userName === 'My Node';
   const screen = document.createElement('div');
   screen.style.cssText = `
     position: fixed; inset: 0; background: #0d0d0d;
@@ -32,11 +35,27 @@ export function showLoginScreen(
       Sovereign P2P voice &amp; video — no servers required
     </p>
 
+    <!-- First-run name setup -->
+    ${isFirstRun ? `
+    <div style="width: 100%; max-width: 360px; background: #161616;
+      border: 1px solid #22c55e40; border-radius: 16px; padding: 18px 20px; margin-bottom: 20px;">
+      <div style="font-size: 12px; font-weight: 700; color: #4ade80; margin-bottom: 10px; display: flex; align-items: center; gap: 6px;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2L3 6v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V6l-9-4z"/></svg>
+        First time? Choose your name
+      </div>
+      <input id="first-run-name" type="text" placeholder="Your name (e.g. Alice)" maxlength="40" style="
+        width: 100%; padding: 10px 12px; background: #0d0d0d; border: 1px solid #333;
+        border-radius: 8px; color: #fff; font-size: 15px; font-weight: 600; margin-bottom: 6px;
+      " />
+      <div style="font-size: 11px; color: #555;">This is how you appear to contacts. Change it any time in Settings.</div>
+    </div>
+    ` : ''}
+
     <!-- Identity card -->
     <div style="width: 100%; max-width: 360px; background: #161616;
       border: 1px solid #262626; border-radius: 16px; padding: 18px 20px; margin-bottom: 28px;">
       <div style="font-size: 11px; font-weight: 700; color: #555; text-transform: uppercase;
-        letter-spacing: 0.1em; margin-bottom: 10px;">Your Node Identity</div>
+        letter-spacing: 0.1em; margin-bottom: 10px;">Your Mesh Address</div>
 
       <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 14px;">
         <div style="width: 44px; height: 44px; border-radius: 12px; background: #1e3a2b;
@@ -50,16 +69,26 @@ export function showLoginScreen(
           <div id="login-node-name" style="font-size: 16px; font-weight: 700; color: #fff;">
             ${escapeHtml(settings.userName)}
           </div>
-          <div style="font-size: 11px; color: #555; font-family: monospace; margin-top: 2px; word-break: break-all;">
-            ${formatFingerprint(settings.publicKey)}
+          <div style="font-size: 10px; color: #4ade80; font-family: monospace; margin-top: 3px; word-break: break-all;">
+            ${nip19.npubEncode(settings.publicKey).slice(0, 28)}…
           </div>
         </div>
       </div>
 
-      <div style="border-top: 1px solid #222; padding-top: 12px;">
-        <div style="font-size: 11px; color: #555; margin-bottom: 4px;">Relay</div>
-        <div style="font-size: 12px; color: #4ade80; font-family: monospace; word-break: break-all;">
-          ${escapeHtml((settings.nostrRelays ?? [])[0] ?? 'wss://omokoda.duckdns.org:3443')}
+      <div style="background: #0d0d0d; border-radius: 8px; padding: 8px 10px; font-size: 10px; color: #555; font-family: monospace; word-break: break-all; margin-bottom: 10px;">
+        ${formatFingerprint(settings.publicKey)}
+      </div>
+
+      <div style="border-top: 1px solid #222; padding-top: 10px; display: flex; justify-content: space-between; align-items: center;">
+        <div>
+          <div style="font-size: 11px; color: #555; margin-bottom: 2px;">Relay</div>
+          <div style="font-size: 11px; color: #4ade80; font-family: monospace;">
+            ${escapeHtml((settings.nostrRelays ?? [])[0]?.replace('wss://', '') ?? 'not set')}
+          </div>
+        </div>
+        <div style="font-size: 11px; color: #555; text-align: right;">
+          <div>Your address is unique</div>
+          <div>to this device/browser</div>
         </div>
       </div>
     </div>
@@ -94,6 +123,19 @@ export function showLoginScreen(
 
   const btn = screen.querySelector('#btn-connect') as HTMLButtonElement;
   btn.addEventListener('click', () => {
+    // Save name on first run
+    if (isFirstRun) {
+      const nameInput = screen.querySelector('#first-run-name') as HTMLInputElement | null;
+      const name = nameInput?.value.trim();
+      if (!name) {
+        if (nameInput) { nameInput.style.borderColor = '#ef4444'; nameInput.focus(); }
+        return;
+      }
+      const s = storage.getSettings();
+      s.userName = name;
+      storage.saveSettings(s);
+    }
+
     btn.disabled = true;
     btn.innerHTML = `
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
