@@ -1,12 +1,13 @@
 import { Contact, ActiveCallState, CallStats, InCallChatMessage, CallEvent } from '../types';
 import { audioSynth } from './audioSynthesizer';
 import { storage } from './storage';
-import { NostrRelay, hexToBytes, SignalPayload, DEFAULT_RELAY } from './nostr';
+import { NostrRelay, hexToBytes, SignalPayload, DEFAULT_RELAY, sendToRelays } from './nostr';
 
 export type CallStateListener = (state: ActiveCallState, contact: Contact | null) => void;
 export type StatsListener = (stats: CallStats) => void;
 export type ChatListener = (message: InCallChatMessage) => void;
 export type MediaStreamListener = (localStream: MediaStream | null, remoteStream: MediaStream | null) => void;
+export type RelayStatusListener = (connected: boolean, url: string) => void;
 
 const STUN_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -48,22 +49,39 @@ class CallManager {
   private statsListeners: Set<StatsListener> = new Set();
   private chatListeners: Set<ChatListener> = new Set();
   private mediaListeners: Set<MediaStreamListener> = new Set();
+  private relayStatusListeners: Set<RelayStatusListener> = new Set();
   private chatMessages: InCallChatMessage[] = [];
+  private currentRelayUrl = DEFAULT_RELAY;
 
   // ── init ───────────────────────────────────────────────────────────────
 
-  /** Call once at app startup to connect to the Nostr relay. */
+  /** Connect to the Nostr relay. Safe to call multiple times (reconnects). */
   init(): void {
+    if (this.relay) {
+      this.relay.disconnect();
+      this.relay = null;
+    }
     const settings = storage.getSettings();
-    const relayUrl = (settings.nostrRelays ?? [])[0] ?? DEFAULT_RELAY;
+    this.currentRelayUrl = (settings.nostrRelays ?? [])[0] ?? DEFAULT_RELAY;
     try {
-      this.relay = NostrRelay.fromHexSeckey(settings.privateKey, relayUrl);
+      this.relay = NostrRelay.fromHexSeckey(settings.privateKey, this.currentRelayUrl);
       this.relay.onSignal(({ signal, senderPk }) => this._onIncomingSignal(signal, senderPk));
+      this.relay.onStatusChange((connected) => {
+        this.relayStatusListeners.forEach(cb => cb(connected, this.currentRelayUrl));
+      });
       this.relay.connect();
-      console.info('[CallManager] relay connected →', relayUrl, '| npub prefix:', settings.publicKey.slice(0, 8));
+      console.info('[CallManager] relay connecting →', this.currentRelayUrl);
     } catch (err) {
       console.warn('[CallManager] relay init failed:', err);
     }
+  }
+
+  /** Disconnect relay and stop receiving calls (go offline). */
+  logout(): void {
+    if (this.currentState !== 'idle') this.endCall();
+    this.relay?.disconnect();
+    this.relay = null;
+    this.relayStatusListeners.forEach(cb => cb(false, this.currentRelayUrl));
   }
 
   // ── accessors ──────────────────────────────────────────────────────────
@@ -100,12 +118,37 @@ class CallManager {
     this.mediaListeners.add(cb);
     return () => this.mediaListeners.delete(cb);
   }
+  onRelayStatus(cb: RelayStatusListener): () => void {
+    this.relayStatusListeners.add(cb);
+    return () => this.relayStatusListeners.delete(cb);
+  }
+  getRelayUrl(): string { return this.currentRelayUrl; }
+  isRelayConnected(): boolean { return this.relay?.isConnected ?? false; }
 
   private notifyState(): void {
     this.stateListeners.forEach(cb => cb(this.currentState, this.currentContact));
   }
   private notifyMedia(): void {
     this.mediaListeners.forEach(cb => cb(this.localStream, this.remoteStream));
+  }
+  private _showCallError(message: string): void {
+    const existing = document.getElementById('call-error-toast');
+    if (existing) existing.remove();
+    const toast = document.createElement('div');
+    toast.id = 'call-error-toast';
+    toast.style.cssText = `
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      background: #3d1515; border: 1px solid #7f1d1d; color: #fca5a5;
+      padding: 12px 20px; border-radius: 12px; font-size: 13px; font-weight: 500;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.6); z-index: 2000;
+      display: flex; align-items: center; gap: 10px; max-width: 90vw;
+    `;
+    toast.innerHTML = `
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+      <span>${message}</span>
+    `;
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), 5000);
   }
 
   // ── media ──────────────────────────────────────────────────────────────
@@ -308,12 +351,7 @@ class CallManager {
     if (this.currentState !== 'idle') return;
 
     if (!this.relay?.isConnected) {
-      console.warn('[CallManager] relay not connected — cannot start real call');
-      // Surface the error via a brief state cycle so the UI can react
-      this.currentContact = contact;
-      this.currentState = 'error';
-      this.notifyState();
-      setTimeout(() => { this.currentState = 'idle'; this.currentContact = null; this.notifyState(); }, 2000);
+      this._showCallError(`Not connected to relay — go offline then back online`);
       return;
     }
 
@@ -339,11 +377,23 @@ class CallManager {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
-      this.relay.sendSignal(contact.publicKey, {
+      const offerSignal: SignalPayload = {
         type: 'offer',
         call_id: this.activeCallId!,
         sdp: offer.sdp!,
-      });
+      };
+      const sent = this.relay.sendSignal(contact.publicKey, offerSignal);
+      // Also deliver to any relays the contact specified (they may not share ours)
+      const contactRelays = (contact.relays ?? []).filter(r => r !== this.currentRelayUrl);
+      if (contactRelays.length) {
+        const sk = hexToBytes(storage.getSettings().privateKey);
+        sendToRelays(contactRelays, sk, contact.publicKey, offerSignal);
+      }
+      if (!sent && !contactRelays.length) {
+        this._showCallError('Could not reach relay. Check your connection.');
+        this.endCall('outgoing_error');
+        return;
+      }
 
       this.currentState = 'ringing';
       this.notifyState();

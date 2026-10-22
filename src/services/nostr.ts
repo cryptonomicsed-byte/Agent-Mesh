@@ -92,8 +92,8 @@ export function decryptSignalEvent(
   return { plaintext: outer, senderPk: event.pubkey };
 }
 
-const DEFAULT_RELAY = 'wss://omokoda.duckdns.org:3443';
-const FALLBACK_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol'];
+export const DEFAULT_RELAY = 'wss://omokoda.duckdns.org:3443';
+export const FALLBACK_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol'];
 
 export class NostrRelay {
   readonly ourPk: PubKeyHex;
@@ -103,6 +103,7 @@ export class NostrRelay {
   private reconnectMs = 2000;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private signalHandlers: Array<(s: IncomingSignal) => void> = [];
+  private statusHandlers: Array<(connected: boolean) => void> = [];
 
   constructor(
     private readonly url: string,
@@ -124,6 +125,11 @@ export class NostrRelay {
   onSignal(cb: (s: IncomingSignal) => void): () => void {
     this.signalHandlers.push(cb);
     return () => { this.signalHandlers = this.signalHandlers.filter(h => h !== cb); };
+  }
+
+  onStatusChange(cb: (connected: boolean) => void): () => void {
+    this.statusHandlers.push(cb);
+    return () => { this.statusHandlers = this.statusHandlers.filter(h => h !== cb); };
   }
 
   connect(): void {
@@ -151,6 +157,7 @@ export class NostrRelay {
           'REQ', this.subId,
           { kinds: [1059], '#p': [this.ourPk], since },
         ]));
+        this.statusHandlers.forEach(h => h(true));
       };
 
       ws.onmessage = (e: MessageEvent) => {
@@ -164,6 +171,7 @@ export class NostrRelay {
 
       ws.onerror = () => {};
       ws.onclose = () => {
+        this.statusHandlers.forEach(h => h(false));
         if (!this.closed) {
           this.reconnectTimer = setTimeout(() => {
             this.reconnectMs = Math.min(this.reconnectMs * 1.5, 30000);
@@ -200,4 +208,19 @@ export class NostrRelay {
   }
 }
 
-export { DEFAULT_RELAY, FALLBACK_RELAYS };
+/** Fire-and-forget: publish a signal event to a list of extra relay URLs (used for contacts on different relays). */
+export function sendToRelays(urls: string[], senderSk: SecKey, recipientPk: PubKeyHex, signal: SignalPayload): void {
+  if (!urls.length) return;
+  const event = buildSignalEvent(senderSk, recipientPk, JSON.stringify(signal));
+  for (const url of urls) {
+    try {
+      const ws = new WebSocket(url);
+      ws.onopen = () => {
+        ws.send(JSON.stringify(['EVENT', event]));
+        setTimeout(() => ws.close(), 4000);
+      };
+      ws.onerror = () => ws.close();
+    } catch {}
+  }
+}
+

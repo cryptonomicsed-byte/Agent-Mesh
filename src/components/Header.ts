@@ -9,8 +9,9 @@ export function createHeader(
     onAddressManagement: () => void;
     onSettings: () => void;
     onAbout: () => void;
+    onLogout: () => void;
   }
-): HTMLElement {
+): { element: HTMLElement; setRelayStatus: (connected: boolean) => void } {
   const header = document.createElement('header');
   header.className = 'w-full bg-[#181818] border-b border-[#2d2d2d] px-4 py-3 sticky top-0 z-30 shadow-md flex items-center justify-between gap-3';
   header.style.cssText = `
@@ -40,8 +41,8 @@ export function createHeader(
           <span style="font-size: 11px; font-weight: 600; background: #22c55e25; color: #4ade80; border: 1px solid #22c55e40; padding: 1px 7px; border-radius: 9999px;">P2P Mesh</span>
         </div>
         <div style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
-          <span style="display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 6px #22c55e;"></span>
-          <span id="header-node-status">Listening :${settings.listenPort} • ${settings.activeAddresses[0] || 'Local'}</span>
+          <span id="relay-status-dot" style="display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #f59e0b; box-shadow: 0 0 6px #f59e0b; transition: background 0.3s, box-shadow 0.3s;"></span>
+          <span id="header-node-status">${settings.userName} • ${settings.publicKey.slice(0, 8)}…</span>
         </div>
       </div>
     </div>
@@ -90,6 +91,16 @@ export function createHeader(
           <circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>
         </svg>
       </button>
+
+      <button id="btn-logout" title="Go Offline / Logout" style="
+        padding: 8px; background: #242424; color: #f87171; border: 1px solid #3a3a3a; border-radius: 8px; display: flex; align-items: center; justify-content: center; cursor: pointer;
+      ">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+          <polyline points="16 17 21 12 16 7"/>
+          <line x1="21" y1="12" x2="9" y2="12"/>
+        </svg>
+      </button>
     </div>
   `;
 
@@ -99,6 +110,15 @@ export function createHeader(
   header.querySelector('#btn-scan-qr')?.addEventListener('click', handlers.onScanQR);
   header.querySelector('#btn-settings')?.addEventListener('click', handlers.onSettings);
   header.querySelector('#btn-about')?.addEventListener('click', handlers.onAbout);
+  header.querySelector('#btn-logout')?.addEventListener('click', handlers.onLogout);
 
-  return header;
+  function setRelayStatus(connected: boolean) {
+    const dot = header.querySelector('#relay-status-dot') as HTMLElement | null;
+    if (!dot) return;
+    dot.style.background = connected ? '#22c55e' : '#ef4444';
+    dot.style.boxShadow = connected ? '0 0 6px #22c55e' : '0 0 6px #ef4444';
+    dot.title = connected ? 'Relay connected' : 'Relay disconnected';
+  }
+
+  return { element: header, setRelayStatus };
 }

@@ -5,6 +5,7 @@ import { createHeader } from './components/Header';
 import { createContactList } from './components/ContactList';
 import { createCallHistory } from './components/CallHistory';
 import { createCallScreen } from './components/CallScreen';
+import { showLoginScreen } from './components/LoginScreen';
 import {
   showMyQRModal,
   showScanQRModal,
@@ -17,8 +18,48 @@ function initApp() {
   const root = document.getElementById('root');
   if (!root) return;
 
-  // Connect to Nostr relay for real call signaling
-  callManager.init();
+  // Session flag: cleared when tab/browser closes
+  const SESSION_KEY = 'mesh_online';
+
+  if (!sessionStorage.getItem(SESSION_KEY)) {
+    showLogin(root, SESSION_KEY);
+    return;
+  }
+
+  launchMain(root, SESSION_KEY);
+}
+
+function showLogin(root: HTMLElement, sessionKey: string) {
+  root.innerHTML = '';
+  let settings = storage.getSettings();
+
+  const loginEl = showLoginScreen(
+    settings,
+    () => {
+      sessionStorage.setItem(sessionKey, '1');
+      callManager.init();
+      root.removeChild(loginEl);
+      launchMain(root, sessionKey);
+    },
+    () => {
+      showSettingsModal(settings, () => {
+        settings = storage.getSettings();
+        // Refresh the login screen identity display
+        root.removeChild(loginEl);
+        const updated = showLoginScreen(settings, () => {
+          sessionStorage.setItem(sessionKey, '1');
+          callManager.init();
+          root.removeChild(updated);
+          launchMain(root, sessionKey);
+        }, () => {});
+        root.appendChild(updated);
+      });
+    },
+  );
+  root.appendChild(loginEl);
+}
+
+function launchMain(root: HTMLElement, sessionKey: string) {
 
   root.innerHTML = '';
   root.style.cssText = `
@@ -69,7 +110,7 @@ function initApp() {
   `;
 
   // Header
-  const header = createHeader(settings, {
+  const { element: header, setRelayStatus } = createHeader(settings, {
     onShowMyQR: () => showMyQRModal(settings, () => refreshData()),
     onScanQR: () =>
       showScanQRModal((scanned) => {
@@ -86,7 +127,18 @@ function initApp() {
         refreshData();
       }),
     onAbout: () => showAboutModal(),
+    onLogout: () => {
+      callManager.logout();
+      sessionStorage.removeItem(sessionKey);
+      root.innerHTML = '';
+      showLogin(root, sessionKey);
+    },
   });
+
+  // Wire relay status → header dot
+  callManager.onRelayStatus((connected) => setRelayStatus(connected));
+  // Reflect current state immediately
+  setRelayStatus(callManager.isRelayConnected());
 
   appContainer.appendChild(header);
 
@@ -231,7 +283,7 @@ function initApp() {
 
     const statusEl = header.querySelector('#header-node-status');
     if (statusEl) {
-      statusEl.textContent = `Listening :${settings.listenPort} • ${settings.activeAddresses[0] || 'Local'}`;
+      statusEl.textContent = `${settings.userName} • ${settings.publicKey.slice(0, 8)}…`;
     }
 
     renderTabs();
