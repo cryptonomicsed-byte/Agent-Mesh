@@ -13,7 +13,7 @@ function makeDefaultSettings(): AppSettings {
     publicKey,
     privateKey,
     nostrRelays: [DEFAULT_RELAY],
-    turnCredsUrl: '',
+    turnCredsUrl: 'https://omokoda.duckdns.org/turn-creds',
     listenPort: 10008,
     addresses: [],
     activeAddresses: [],
@@ -25,6 +25,14 @@ function makeDefaultSettings(): AppSettings {
 }
 
 const SEED_CONTACTS: Contact[] = [
+  {
+    name: 'Agent Voice (AI)',
+    publicKey: 'c148f3b60583ebc9c3eb8e42f44a4c78f8f5f59bbf6d47e553d3d030e9f1ab65',
+    addresses: ['omokoda.duckdns.org:10008'],
+    relays: ['wss://omokoda.duckdns.org:3443'],
+    state: 'online',
+    addedAt: Date.now() - 3600000,
+  },
   {
     name: 'Freifunk Mesh Gateway (Node #18)',
     publicKey: 'a1f893d9b048123ef6177bc954e7d14872c05e19741b689a7702ec9432bfd12e',
