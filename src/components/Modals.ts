@@ -424,6 +424,18 @@ export function showSettingsModal(settings: AppSettings, onUpdated: () => void):
     </div>
 
     <div>
+      <label style="display: block; font-size: 13px; font-weight: 600; color: #ccc; margin-bottom: 6px;">Nostr Signalling Relays</label>
+      <textarea id="settings-relays" rows="2" style="width: 100%; font-family: monospace; font-size: 12px;">${(settings.nostrRelays || []).join('\n')}</textarea>
+      <div style="font-size: 11px; color: #666; margin-top: 3px;">One relay URL per line (wss://…)</div>
+    </div>
+
+    <div>
+      <label style="display: block; font-size: 13px; font-weight: 600; color: #ccc; margin-bottom: 6px;">TURN Credentials URL</label>
+      <input id="settings-turn-url" type="text" value="${settings.turnCredsUrl || ''}" placeholder="https://…/turn-creds" style="width: 100%; font-family: monospace; font-size: 12px;" />
+      <div style="font-size: 11px; color: #666; margin-top: 3px;">Leave blank to skip TURN (LAN-only mode)</div>
+    </div>
+
+    <div>
       <label style="display: block; font-size: 13px; font-weight: 600; color: #ccc; margin-bottom: 6px;">Signalling Listen Port</label>
       <input id="settings-port" type="number" value="${settings.listenPort}" style="width: 100%;" />
     </div>
@@ -526,6 +538,9 @@ export function showSettingsModal(settings: AppSettings, onUpdated: () => void):
   content.querySelector('#btn-save-settings')?.addEventListener('click', () => {
     if (isTesting) audioSynth.stopAll();
     settings.userName = (content.querySelector('#settings-name') as HTMLInputElement).value.trim() || 'My Node';
+    settings.nostrRelays = (content.querySelector('#settings-relays') as HTMLTextAreaElement).value
+      .split('\n').map(s => s.trim()).filter(s => s.startsWith('ws'));
+    settings.turnCredsUrl = (content.querySelector('#settings-turn-url') as HTMLInputElement).value.trim();
     settings.listenPort = parseInt((content.querySelector('#settings-port') as HTMLInputElement).value, 10) || 10008;
     settings.enableVideoDefault = (content.querySelector('#settings-video') as HTMLInputElement).checked;
     settings.ringtoneVolume = parseFloat((content.querySelector('#settings-volume') as HTMLInputElement).value);
