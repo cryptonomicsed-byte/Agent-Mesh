@@ -1,0 +1,6 @@
+{
+  "name": "Meshenger - P2P Voice & Video Calls",
+  "description": "Direct voice and video phone calls without servers or internet accounts. Exchange contacts via QR codes over local WiFi and community mesh networks.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": []
+}
