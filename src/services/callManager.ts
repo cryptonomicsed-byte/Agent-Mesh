@@ -164,16 +164,30 @@ class CallManager {
 
   // ── WebRTC peer connection ─────────────────────────────────────────────
 
+  private async _fetchTurnCreds(): Promise<RTCIceServer | null> {
+    const settings = storage.getSettings();
+    // Try in order: configured public URL → local agent-voice sidecar
+    const candidates = [
+      ...(settings.turnCredsUrl ? [settings.turnCredsUrl] : []),
+      'http://127.0.0.1:8788/turn-creds',
+    ];
+    for (const url of candidates) {
+      try {
+        const r = await fetch(url, { signal: AbortSignal.timeout(2500) });
+        if (r.ok) return await r.json() as RTCIceServer;
+      } catch {}
+    }
+    return null;
+  }
+
   private async _buildPeerConnection(): Promise<RTCPeerConnection> {
     const iceServers: RTCIceServer[] = [...STUN_SERVERS];
 
-    // Fetch TURN credentials from agent-voice if running locally
-    try {
-      const r = await fetch('http://127.0.0.1:8788/turn-creds', {
-        signal: AbortSignal.timeout(2000),
-      });
-      if (r.ok) iceServers.push(await r.json() as RTCIceServer);
-    } catch {}
+    const turn = await this._fetchTurnCreds();
+    if (turn) {
+      iceServers.push(turn);
+      console.info('[CallManager] TURN server added:', (turn as any).urls?.[0]);
+    }
 
     const pc = new RTCPeerConnection({ iceServers });
     this.pc = pc;

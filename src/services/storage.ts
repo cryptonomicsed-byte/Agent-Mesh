@@ -13,6 +13,7 @@ function makeDefaultSettings(): AppSettings {
     publicKey,
     privateKey,
     nostrRelays: [DEFAULT_RELAY],
+    turnCredsUrl: '',
     listenPort: 10008,
     addresses: [],
     activeAddresses: [],
@@ -84,8 +85,9 @@ class StorageService {
       if (stored.privateKey?.length === 64) {
         try { stored.publicKey = derivePublicKey(stored.privateKey); } catch {}
       }
-      // Backfill nostrRelays if missing from old data
+      // Backfill fields missing from old data
       if (!stored.nostrRelays?.length) stored.nostrRelays = [DEFAULT_RELAY];
+      if (stored.turnCredsUrl === undefined) stored.turnCredsUrl = '';
       return stored;
     } catch {
       const defaults = makeDefaultSettings();

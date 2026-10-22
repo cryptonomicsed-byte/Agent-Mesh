@@ -42,6 +42,7 @@ export interface AppSettings {
   publicKey: string; // 64-char hex secp256k1 x-coordinate (Nostr pubkey)
   privateKey: string; // 64-char hex secp256k1 secret key
   nostrRelays: string[]; // Nostr relay URLs to use for signaling
+  turnCredsUrl: string; // Public HTTPS URL for TURN credentials (e.g. https://vantage-host/api/turn-creds)
   listenPort: number;
   addresses: string[]; // My detected & custom addresses
   activeAddresses: string[]; // Addresses included in my QR code
