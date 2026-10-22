@@ -1,13 +1,27 @@
 import { Contact, ActiveCallState, CallStats, InCallChatMessage, CallEvent } from '../types';
 import { audioSynth } from './audioSynthesizer';
 import { storage } from './storage';
+import { NostrRelay, hexToBytes, SignalPayload, DEFAULT_RELAY } from './nostr';
 
 export type CallStateListener = (state: ActiveCallState, contact: Contact | null) => void;
 export type StatsListener = (stats: CallStats) => void;
 export type ChatListener = (message: InCallChatMessage) => void;
 export type MediaStreamListener = (localStream: MediaStream | null, remoteStream: MediaStream | null) => void;
 
+const STUN_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+];
+
+function randomHex(n = 16): string {
+  const b = new Uint8Array(n);
+  crypto.getRandomValues(b);
+  return Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+}
+
 class CallManager {
+  // ── state ──────────────────────────────────────────────────────────────
   private currentState: ActiveCallState = 'idle';
   private currentContact: Contact | null = null;
   private isIncoming = false;
@@ -16,186 +30,278 @@ class CallManager {
   private isCameraOff = false;
   private isSpeakerOn = true;
   private callStartTime = 0;
-  private callDurationInterval: number | null = null;
-  private statsInterval: number | null = null;
-  private simulatedLoopbackInterval: number | null = null;
+  private statsInterval: ReturnType<typeof setInterval> | null = null;
 
   private localStream: MediaStream | null = null;
   private remoteStream: MediaStream | null = null;
-  private peerConnection: RTCPeerConnection | null = null;
-  private dataChannel: RTCDataChannel | null = null;
 
+  // ── real WebRTC ────────────────────────────────────────────────────────
+  private pc: RTCPeerConnection | null = null;
+  private relay: NostrRelay | null = null;
+  private activeCallId: string | null = null;
+  private pendingCallerPk: string | null = null;
+  private pendingOfferSdp: string | null = null;
+  private isSimulated = false;
+
+  // ── listeners ──────────────────────────────────────────────────────────
   private stateListeners: Set<CallStateListener> = new Set();
   private statsListeners: Set<StatsListener> = new Set();
   private chatListeners: Set<ChatListener> = new Set();
   private mediaListeners: Set<MediaStreamListener> = new Set();
-
   private chatMessages: InCallChatMessage[] = [];
 
-  constructor() {
-    // Setup initial state
+  // ── init ───────────────────────────────────────────────────────────────
+
+  /** Call once at app startup to connect to the Nostr relay. */
+  init(): void {
+    const settings = storage.getSettings();
+    const relayUrl = (settings.nostrRelays ?? [])[0] ?? DEFAULT_RELAY;
+    try {
+      this.relay = NostrRelay.fromHexSeckey(settings.privateKey, relayUrl);
+      this.relay.onSignal(({ signal, senderPk }) => this._onIncomingSignal(signal, senderPk));
+      this.relay.connect();
+      console.info('[CallManager] relay connected →', relayUrl, '| npub prefix:', settings.publicKey.slice(0, 8));
+    } catch (err) {
+      console.warn('[CallManager] relay init failed:', err);
+    }
   }
 
-  getState(): ActiveCallState {
-    return this.currentState;
-  }
+  // ── accessors ──────────────────────────────────────────────────────────
 
-  getCurrentContact(): Contact | null {
-    return this.currentContact;
-  }
-
-  getIsIncoming(): boolean {
-    return this.isIncoming;
-  }
-
-  getHasVideo(): boolean {
-    return this.hasVideo;
-  }
-
-  getIsMuted(): boolean {
-    return this.isMuted;
-  }
-
-  getIsCameraOff(): boolean {
-    return this.isCameraOff;
-  }
-
-  getIsSpeakerOn(): boolean {
-    return this.isSpeakerOn;
-  }
-
-  getChatMessages(): InCallChatMessage[] {
-    return [...this.chatMessages];
-  }
-
-  getLocalStream(): MediaStream | null {
-    return this.localStream;
-  }
-
-  getRemoteStream(): MediaStream | null {
-    return this.remoteStream;
-  }
-
+  getState(): ActiveCallState { return this.currentState; }
+  getCurrentContact(): Contact | null { return this.currentContact; }
+  getIsIncoming(): boolean { return this.isIncoming; }
+  getHasVideo(): boolean { return this.hasVideo; }
+  getIsMuted(): boolean { return this.isMuted; }
+  getIsCameraOff(): boolean { return this.isCameraOff; }
+  getIsSpeakerOn(): boolean { return this.isSpeakerOn; }
+  getChatMessages(): InCallChatMessage[] { return [...this.chatMessages]; }
+  getLocalStream(): MediaStream | null { return this.localStream; }
+  getRemoteStream(): MediaStream | null { return this.remoteStream; }
   getCallDuration(): number {
-    if (this.callStartTime === 0) return 0;
-    return Math.floor((Date.now() - this.callStartTime) / 1000);
+    return this.callStartTime ? Math.floor((Date.now() - this.callStartTime) / 1000) : 0;
   }
+
+  // ── listener registration ──────────────────────────────────────────────
 
   onStateChange(cb: CallStateListener): () => void {
     this.stateListeners.add(cb);
     return () => this.stateListeners.delete(cb);
   }
-
   onStatsUpdate(cb: StatsListener): () => void {
     this.statsListeners.add(cb);
     return () => this.statsListeners.delete(cb);
   }
-
   onChatMessage(cb: ChatListener): () => void {
     this.chatListeners.add(cb);
     return () => this.chatListeners.delete(cb);
   }
-
   onMediaChange(cb: MediaStreamListener): () => void {
     this.mediaListeners.add(cb);
     return () => this.mediaListeners.delete(cb);
   }
 
   private notifyState(): void {
-    this.stateListeners.forEach((cb) => cb(this.currentState, this.currentContact));
+    this.stateListeners.forEach(cb => cb(this.currentState, this.currentContact));
   }
-
   private notifyMedia(): void {
-    this.mediaListeners.forEach((cb) => cb(this.localStream, this.remoteStream));
+    this.mediaListeners.forEach(cb => cb(this.localStream, this.remoteStream));
   }
 
-  /**
-   * Acquire camera & mic media streams
-   */
+  // ── media ──────────────────────────────────────────────────────────────
+
   private async acquireMedia(video: boolean): Promise<MediaStream> {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      return await navigator.mediaDevices.getUserMedia({
         audio: true,
         video: video ? { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' } : false,
       });
-      return stream;
     } catch (err) {
-      console.warn('Real camera/mic unavailable, creating synthetic canvas media stream', err);
-      // Fallback: create synthetic canvas video stream and audio oscillator stream
-      return this.createSyntheticMediaStream(video, 'My Node');
+      console.warn('[CallManager] real media unavailable, using synthetic stream', err);
+      return this._syntheticStream(video, 'Me');
     }
   }
 
-  private createSyntheticMediaStream(hasVideo: boolean, label: string): MediaStream {
+  private _syntheticStream(hasVideo: boolean, label: string): MediaStream {
     const canvas = document.createElement('canvas');
-    canvas.width = 640;
-    canvas.height = 480;
+    canvas.width = 640; canvas.height = 480;
     const ctx = canvas.getContext('2d')!;
-
     let frame = 0;
     const draw = () => {
       frame++;
-      // Background gradient
-      const grad = ctx.createLinearGradient(0, 0, 640, 480);
-      grad.addColorStop(0, '#1c1917');
-      grad.addColorStop(1, '#0c0a09');
-      ctx.fillStyle = grad;
-      ctx.fillRect(0, 0, 640, 480);
-
-      // Node mesh circles
-      ctx.strokeStyle = '#22c55e';
-      ctx.lineWidth = 2;
+      const g = ctx.createLinearGradient(0, 0, 640, 480);
+      g.addColorStop(0, '#1c1917'); g.addColorStop(1, '#0c0a09');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, 640, 480);
+      ctx.strokeStyle = '#22c55e'; ctx.lineWidth = 2;
       for (let i = 0; i < 5; i++) {
-        const radius = 30 + i * 25 + Math.sin(frame * 0.05 + i) * 6;
-        ctx.beginPath();
-        ctx.arc(320, 240, radius, 0, Math.PI * 2);
-        ctx.stroke();
+        const r = 30 + i * 25 + Math.sin(frame * 0.05 + i) * 6;
+        ctx.beginPath(); ctx.arc(320, 240, r, 0, Math.PI * 2); ctx.stroke();
       }
-
-      // Avatar circle
-      ctx.fillStyle = '#22c55e';
-      ctx.beginPath();
-      ctx.arc(320, 240, 48, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Label text
-      ctx.fillStyle = '#ffffff';
-      ctx.font = 'bold 24px sans-serif';
-      ctx.textAlign = 'center';
+      ctx.fillStyle = '#22c55e'; ctx.beginPath(); ctx.arc(320, 240, 48, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 24px sans-serif'; ctx.textAlign = 'center';
       ctx.fillText(label.slice(0, 2).toUpperCase(), 320, 248);
-
-      ctx.font = '16px monospace';
-      ctx.fillStyle = '#86efac';
-      ctx.fillText(`Mesh Stream: ${label}`, 320, 330);
-      ctx.fillText(`FPS: 30 | Bitrate: ~1.4 Mbps`, 320, 354);
     };
-
     const interval = window.setInterval(draw, 1000 / 30);
-    const canvasStream = canvas.captureStream(30);
-
-    // Create a silent audio track
+    const stream = canvas.captureStream(30);
     try {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      const audioCtx = new AudioCtx();
-      const osc = audioCtx.createOscillator();
-      const dst = audioCtx.createMediaStreamDestination();
-      const gain = audioCtx.createGain();
-      gain.gain.value = 0.001;
-      osc.connect(gain);
-      gain.connect(dst);
-      osc.start();
-      dst.stream.getAudioTracks().forEach((track) => canvasStream.addTrack(track));
+      const ac = new AudioContext();
+      const osc = ac.createOscillator();
+      const dst = ac.createMediaStreamDestination();
+      const gain = ac.createGain(); gain.gain.value = 0.001;
+      osc.connect(gain); gain.connect(dst); osc.start();
+      dst.stream.getAudioTracks().forEach(t => stream.addTrack(t));
     } catch {}
-
-    (canvasStream as any)._syntheticInterval = interval;
-    return canvasStream;
+    (stream as any)._interval = interval;
+    return stream;
   }
 
-  /**
-   * Start an outgoing call to a contact
-   */
-  async startCall(contact: Contact, video: boolean = true): Promise<void> {
+  private _stopStream(stream: MediaStream | null): void {
+    if (!stream) return;
+    stream.getTracks().forEach(t => t.stop());
+    const interval = (stream as any)._interval;
+    if (interval) clearInterval(interval);
+  }
+
+  // ── WebRTC peer connection ─────────────────────────────────────────────
+
+  private async _buildPeerConnection(): Promise<RTCPeerConnection> {
+    const iceServers: RTCIceServer[] = [...STUN_SERVERS];
+
+    // Fetch TURN credentials from agent-voice if running locally
+    try {
+      const r = await fetch('http://127.0.0.1:8788/turn-creds', {
+        signal: AbortSignal.timeout(2000),
+      });
+      if (r.ok) iceServers.push(await r.json() as RTCIceServer);
+    } catch {}
+
+    const pc = new RTCPeerConnection({ iceServers });
+    this.pc = pc;
+
+    pc.onicecandidate = (e) => {
+      if (!e.candidate || !this.activeCallId) return;
+      const peerPk = this.isIncoming ? this.pendingCallerPk : this.currentContact?.publicKey;
+      if (peerPk && this.relay) {
+        this.relay.sendSignal(peerPk, {
+          type: 'ice',
+          call_id: this.activeCallId,
+          candidate: e.candidate.toJSON(),
+        });
+      }
+    };
+
+    pc.ontrack = (e) => {
+      const [stream] = e.streams;
+      if (stream && stream !== this.remoteStream) {
+        this.remoteStream = stream;
+        this.notifyMedia();
+        if (this.currentState !== 'connected') {
+          this.currentState = 'connected';
+          this.callStartTime = Date.now();
+          this.notifyState();
+          audioSynth.playConnectChime();
+          this._startStatsInterval();
+        }
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      const s = pc.connectionState;
+      if (s === 'failed' || s === 'closed') {
+        this.endCall(this.currentState === 'connected' ? undefined : 'outgoing_error');
+      }
+    };
+
+    return pc;
+  }
+
+  private _closePeerConnection(): void {
+    if (this.pc) {
+      this.pc.onicecandidate = null;
+      this.pc.ontrack = null;
+      this.pc.onconnectionstatechange = null;
+      this.pc.close();
+      this.pc = null;
+    }
+  }
+
+  // ── incoming Nostr signals ─────────────────────────────────────────────
+
+  private _onIncomingSignal(signal: SignalPayload, senderPk: string): void {
+    if (signal.type === 'offer') {
+      if (this.currentState !== 'idle') return; // already in a call
+      this.pendingCallerPk = senderPk;
+      this.activeCallId = signal.call_id;
+      this.pendingOfferSdp = signal.sdp ?? null;
+      this.isSimulated = false;
+
+      const contacts = storage.getContacts();
+      const contact: Contact = contacts.find(c =>
+        c.publicKey.toLowerCase() === senderPk.toLowerCase()
+      ) ?? {
+        name: senderPk.slice(0, 8) + '…',
+        publicKey: senderPk,
+        addresses: [],
+        state: 'online',
+      };
+
+      this.currentContact = contact;
+      this.isIncoming = true;
+      this.hasVideo = true;
+      this.isMuted = false;
+      this.isCameraOff = false;
+      this.chatMessages = [];
+      this.currentState = 'ringing';
+      this.notifyState();
+      audioSynth.startIncomingRinging(storage.getSettings().ringtoneVolume);
+      return;
+    }
+
+    // Subsequent signals must match the active call
+    if (signal.call_id !== this.activeCallId || this.isSimulated) return;
+
+    if (signal.type === 'answer' && this.pc && signal.sdp) {
+      this.pc.setRemoteDescription(
+        new RTCSessionDescription({ type: 'answer', sdp: signal.sdp })
+      ).catch(err => console.warn('[CallManager] setRemoteDescription(answer):', err));
+      return;
+    }
+
+    if (signal.type === 'ice' && this.pc && signal.candidate) {
+      this.pc.addIceCandidate(
+        new RTCIceCandidate(signal.candidate)
+      ).catch(err => console.warn('[CallManager] addIceCandidate:', err));
+      return;
+    }
+
+    if (signal.type === 'hangup') {
+      this._hangupReceived();
+    }
+  }
+
+  private _hangupReceived(): void {
+    audioSynth.stopAll();
+    audioSynth.playEndChime();
+    this._finishCall(this.currentState === 'connected'
+      ? (this.isIncoming ? 'incoming_accepted' : 'outgoing_accepted')
+      : (this.isIncoming ? 'incoming_missed' : 'outgoing_missed'));
+  }
+
+  // ── public call actions ────────────────────────────────────────────────
+
+  /** Start an outgoing call to a contact via Nostr + WebRTC. */
+  async startCall(contact: Contact, video = true): Promise<void> {
     if (this.currentState !== 'idle') return;
+
+    if (!this.relay?.isConnected) {
+      console.warn('[CallManager] relay not connected — cannot start real call');
+      // Surface the error via a brief state cycle so the UI can react
+      this.currentContact = contact;
+      this.currentState = 'error';
+      this.notifyState();
+      setTimeout(() => { this.currentState = 'idle'; this.currentContact = null; this.notifyState(); }, 2000);
+      return;
+    }
 
     this.currentContact = contact;
     this.isIncoming = false;
@@ -203,168 +309,143 @@ class CallManager {
     this.isMuted = false;
     this.isCameraOff = !video;
     this.chatMessages = [];
+    this.isSimulated = false;
+    this.activeCallId = randomHex(16);
     this.currentState = 'calling';
     this.notifyState();
-
     audioSynth.startOutgoingRinging(storage.getSettings().ringtoneVolume);
 
     try {
       this.localStream = await this.acquireMedia(video);
       this.notifyMedia();
 
-      // Simulate remote connection establishing after dialing (or answer)
-      setTimeout(() => {
-        if (this.currentState === 'calling') {
-          this.currentState = 'ringing';
-          this.notifyState();
-        }
-      }, 1500);
+      const pc = await this._buildPeerConnection();
+      this.localStream.getTracks().forEach(t => pc.addTrack(t, this.localStream!));
 
-      // Auto-connect after 3.8s for rich testing
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      this.relay.sendSignal(contact.publicKey, {
+        type: 'offer',
+        call_id: this.activeCallId!,
+        sdp: offer.sdp!,
+      });
+
+      this.currentState = 'ringing';
+      this.notifyState();
+
+      // Auto-hangup if no answer within 60 s
       setTimeout(() => {
         if (this.currentState === 'calling' || this.currentState === 'ringing') {
-          this.acceptOrConnectCall();
+          this.endCall('outgoing_missed');
         }
-      }, 3800);
+      }, 60_000);
     } catch (err) {
-      console.error('Call initialization error:', err);
+      console.error('[CallManager] startCall error:', err);
       this.endCall('outgoing_error');
     }
   }
 
-  /**
-   * Simulate or receive an incoming call
-   */
-  simulateIncomingCall(customContact?: Contact): void {
-    if (this.currentState !== 'idle') return;
-
-    const contact = customContact || storage.getContacts()[0] || {
-      name: 'Freifunk Node #18',
-      publicKey: 'a1f893d9b048123ef6177bc954e7d14872c05e19741b689a7702ec9432bfd12e',
-      addresses: ['192.168.1.1:10008'],
-      state: 'online',
-    };
-
-    this.currentContact = contact;
-    this.isIncoming = true;
-    this.hasVideo = true;
-    this.isMuted = false;
-    this.isCameraOff = false;
-    this.chatMessages = [];
-    this.currentState = 'ringing';
-    this.notifyState();
-
-    audioSynth.startIncomingRinging(storage.getSettings().ringtoneVolume);
-  }
-
-  /**
-   * User accepts the call
-   */
+  /** Accept an incoming real call (or simulated one). */
   async acceptCall(): Promise<void> {
     if (this.currentState !== 'ringing' || !this.isIncoming) return;
     audioSynth.stopAll();
-    this.localStream = await this.acquireMedia(this.hasVideo);
-    this.acceptOrConnectCall();
-  }
 
-  /**
-   * Transition to connected state, establish remote stream & metrics
-   */
-  private acceptOrConnectCall(): void {
-    audioSynth.stopAll();
-    audioSynth.playConnectChime();
+    if (this.isSimulated) {
+      // Simulation path: stay on synthetic streams, mark connected
+      this.localStream = await this.acquireMedia(this.hasVideo);
+      this._acceptOrConnectSimulated();
+      return;
+    }
 
-    this.currentState = 'connected';
-    this.callStartTime = Date.now();
-    this.notifyState();
+    // Real WebRTC path
+    try {
+      this.localStream = await this.acquireMedia(this.hasVideo);
+      this.notifyMedia();
 
-    // Create remote media stream (either clone of synthetic or remote peer)
-    this.remoteStream = this.createSyntheticMediaStream(
-      this.hasVideo,
-      this.currentContact ? this.currentContact.name : 'Peer Node'
-    );
-    this.notifyMedia();
+      const pc = await this._buildPeerConnection();
 
-    // Start call stats ticker
-    this.statsInterval = window.setInterval(() => {
-      this.updateStats();
-    }, 1000);
-
-    // Initial greeting chat message from peer
-    setTimeout(() => {
-      if (this.currentState === 'connected') {
-        this.addPeerChatMessage(
-          `Connected directly via ${this.currentContact?.addresses[0] || '192.168.1.105:10008'}. WebRTC encrypted P2P channel established.`
+      if (this.pendingOfferSdp) {
+        await pc.setRemoteDescription(
+          new RTCSessionDescription({ type: 'offer', sdp: this.pendingOfferSdp })
         );
       }
-    }, 1200);
+      this.localStream.getTracks().forEach(t => pc.addTrack(t, this.localStream!));
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      if (this.relay && this.pendingCallerPk && this.activeCallId) {
+        this.relay.sendSignal(this.pendingCallerPk, {
+          type: 'answer',
+          call_id: this.activeCallId,
+          sdp: answer.sdp!,
+        });
+      }
+
+      // Connected state fires from pc.ontrack when remote tracks arrive
+    } catch (err) {
+      console.error('[CallManager] acceptCall error:', err);
+      this.endCall('incoming_error');
+    }
   }
 
-  /**
-   * Decline or hang up call
-   */
+  /** Hang up or decline. */
   endCall(eventTypeOverride?: CallEvent['type']): void {
     audioSynth.stopAll();
     audioSynth.playEndChime();
 
+    // Send hangup signal if we have an active real call
+    if (!this.isSimulated && this.activeCallId) {
+      const peerPk = this.isIncoming ? this.pendingCallerPk : this.currentContact?.publicKey;
+      if (peerPk && this.relay) {
+        this.relay.sendSignal(peerPk, { type: 'hangup', call_id: this.activeCallId, reason: 'bye' });
+      }
+    }
+
+    this._finishCall(eventTypeOverride);
+  }
+
+  private _finishCall(eventTypeOverride?: CallEvent['type']): void {
     const duration = this.getCallDuration();
     const contact = this.currentContact;
-    const isIncoming = this.isIncoming;
+    const incoming = this.isIncoming;
     const wasConnected = this.currentState === 'connected';
 
-    // Stop intervals
-    if (this.statsInterval) {
-      clearInterval(this.statsInterval);
-      this.statsInterval = null;
-    }
-    if (this.callDurationInterval) {
-      clearInterval(this.callDurationInterval);
-      this.callDurationInterval = null;
-    }
+    if (this.statsInterval) { clearInterval(this.statsInterval); this.statsInterval = null; }
+    this._closePeerConnection();
+    this._stopStream(this.localStream); this.localStream = null;
+    this._stopStream(this.remoteStream); this.remoteStream = null;
 
-    // Stop media tracks
-    if (this.localStream) {
-      this.localStream.getTracks().forEach((t) => t.stop());
-      const interval = (this.localStream as any)._syntheticInterval;
-      if (interval) clearInterval(interval);
-      this.localStream = null;
-    }
-    if (this.remoteStream) {
-      this.remoteStream.getTracks().forEach((t) => t.stop());
-      const interval = (this.remoteStream as any)._syntheticInterval;
-      if (interval) clearInterval(interval);
-      this.remoteStream = null;
-    }
-
-    // Record Event in History
     if (contact) {
       let type: CallEvent['type'];
       if (eventTypeOverride) {
         type = eventTypeOverride;
       } else if (wasConnected) {
-        type = isIncoming ? 'incoming_accepted' : 'outgoing_accepted';
+        type = incoming ? 'incoming_accepted' : 'outgoing_accepted';
       } else {
-        type = isIncoming ? 'incoming_missed' : 'outgoing_missed';
+        type = incoming ? 'incoming_missed' : 'outgoing_missed';
       }
-
-      const event: CallEvent = {
+      storage.addEvent({
         id: 'evt-' + Date.now(),
         contactPublicKey: contact.publicKey,
         contactName: contact.name,
         type,
         timestamp: Date.now(),
         duration,
-        addressUsed: contact.addresses[0] || '192.168.1.105:10008',
+        addressUsed: contact.addresses[0] ?? 'nostr',
         hasVideo: this.hasVideo,
-      };
-      storage.addEvent(event);
+      });
     }
 
+    this.activeCallId = null;
+    this.pendingCallerPk = null;
+    this.pendingOfferSdp = null;
+    this.isSimulated = false;
     this.currentState = 'ended';
     this.notifyState();
     this.notifyMedia();
 
-    // Reset to idle after brief animation
     setTimeout(() => {
       this.currentState = 'idle';
       this.currentContact = null;
@@ -374,23 +455,17 @@ class CallManager {
     }, 1200);
   }
 
+  // ── media controls ─────────────────────────────────────────────────────
+
   toggleMute(): boolean {
     this.isMuted = !this.isMuted;
-    if (this.localStream) {
-      this.localStream.getAudioTracks().forEach((track) => {
-        track.enabled = !this.isMuted;
-      });
-    }
+    this.localStream?.getAudioTracks().forEach(t => { t.enabled = !this.isMuted; });
     return this.isMuted;
   }
 
   toggleCamera(): boolean {
     this.isCameraOff = !this.isCameraOff;
-    if (this.localStream) {
-      this.localStream.getVideoTracks().forEach((track) => {
-        track.enabled = !this.isCameraOff;
-      });
-    }
+    this.localStream?.getVideoTracks().forEach(t => { t.enabled = !this.isCameraOff; });
     return this.isCameraOff;
   }
 
@@ -399,56 +474,121 @@ class CallManager {
     return this.isSpeakerOn;
   }
 
+  // ── in-call chat ───────────────────────────────────────────────────────
+
   sendChatMessage(text: string): void {
     if (!text.trim()) return;
     const msg: InCallChatMessage = {
-      id: 'msg-' + Date.now(),
-      sender: 'self',
-      text: text.trim(),
-      timestamp: Date.now(),
+      id: 'msg-' + Date.now(), sender: 'self', text: text.trim(), timestamp: Date.now(),
     };
     this.chatMessages.push(msg);
-    this.chatListeners.forEach((cb) => cb(msg));
+    this.chatListeners.forEach(cb => cb(msg));
 
-    // Simulated peer echo or response
+    if (this.isSimulated) {
+      setTimeout(() => {
+        if (this.currentState === 'connected') this._addPeerChat('Mesh ACK: ' + text.trim().slice(0, 40));
+      }, 1200);
+    }
+  }
+
+  private _addPeerChat(text: string): void {
+    const msg: InCallChatMessage = {
+      id: 'msg-' + Date.now(), sender: 'peer', text, timestamp: Date.now(),
+    };
+    this.chatMessages.push(msg);
+    this.chatListeners.forEach(cb => cb(msg));
+  }
+
+  // ── stats ──────────────────────────────────────────────────────────────
+
+  private _startStatsInterval(): void {
+    if (this.statsInterval) clearInterval(this.statsInterval);
+    this.statsInterval = setInterval(() => this._tick(), 1000);
+  }
+
+  private async _tick(): Promise<void> {
+    if (this.pc && !this.isSimulated) {
+      try {
+        const stats = await this.pc.getStats();
+        let rtt = 0, packetsLost = 0, frameRate = 0;
+        stats.forEach((r: RTCStats) => {
+          const report = r as any;
+          if (report.type === 'remote-inbound-rtp' && report.roundTripTime)
+            rtt = Math.round(report.roundTripTime * 1000);
+          if (report.type === 'remote-inbound-rtp' && report.packetsLost)
+            packetsLost = report.packetsLost;
+          if (report.type === 'inbound-rtp' && report.kind === 'video' && report.framesPerSecond)
+            frameRate = Math.round(report.framesPerSecond);
+        });
+        this.statsListeners.forEach(cb => cb({
+          resolution: this.hasVideo ? '1280×720' : 'Audio Only',
+          frameRate,
+          videoBitrate: this.hasVideo ? 'live' : '0 kbps',
+          audioBitrate: 'Opus',
+          packetsLost,
+          rtt,
+          codec: this.hasVideo ? 'VP8 / Opus' : 'Opus',
+        }));
+        return;
+      } catch {}
+    }
+    // Simulated stats fallback
+    this.statsListeners.forEach(cb => cb({
+      resolution: this.hasVideo ? '1280×720 (sim)' : 'Audio Only (sim)',
+      frameRate: this.hasVideo ? 30 : 0,
+      videoBitrate: this.hasVideo ? '1.4 Mbps' : '0 kbps',
+      audioBitrate: '64 kbps (Opus)',
+      packetsLost: Math.random() > 0.9 ? 1 : 0,
+      rtt: Math.floor(18 + Math.random() * 12),
+      codec: this.hasVideo ? 'VP8 / Opus' : 'Opus',
+    }));
+  }
+
+  // ── simulation (kept for testing / UI demos) ───────────────────────────
+
+  /** Simulate an incoming call without Nostr — useful for UI testing. */
+  simulateIncomingCall(customContact?: Contact): void {
+    if (this.currentState !== 'idle') return;
+
+    const contact = customContact ?? storage.getContacts()[0] ?? {
+      name: 'Freifunk Node #18',
+      publicKey: 'a1f893d9b048123ef6177bc954e7d14872c05e19741b689a7702ec9432bfd12e',
+      addresses: ['192.168.1.1:10008'],
+      state: 'online' as const,
+    };
+
+    this.currentContact = contact;
+    this.isIncoming = true;
+    this.hasVideo = true;
+    this.isMuted = false;
+    this.isCameraOff = false;
+    this.chatMessages = [];
+    this.isSimulated = true;
+    this.activeCallId = randomHex(16);
+    this.pendingCallerPk = null;
+    this.pendingOfferSdp = null;
+    this.currentState = 'ringing';
+    this.notifyState();
+    audioSynth.startIncomingRinging(storage.getSettings().ringtoneVolume);
+  }
+
+  private _acceptOrConnectSimulated(): void {
+    audioSynth.playConnectChime();
+    this.currentState = 'connected';
+    this.callStartTime = Date.now();
+    this.notifyState();
+
+    this.remoteStream = this._syntheticStream(this.hasVideo, this.currentContact?.name ?? 'Peer');
+    this.notifyMedia();
+    this._startStatsInterval();
+
     setTimeout(() => {
       if (this.currentState === 'connected') {
-        const responses = [
-          'Received over encrypted data channel!',
-          'Loud and clear on mesh link.',
-          'Signal strength is strong (SNR 24dB).',
-          'ACK: Packet received with 0 loss.',
-        ];
-        const randomResp = responses[Math.floor(Math.random() * responses.length)];
-        this.addPeerChatMessage(randomResp);
+        this._addPeerChat(
+          `Simulated P2P — real calls use Nostr signaling + WebRTC.\nAddress: ${this.currentContact?.addresses[0] ?? 'N/A'}`
+        );
       }
-    }, 1500);
-  }
-
-  private addPeerChatMessage(text: string): void {
-    const msg: InCallChatMessage = {
-      id: 'msg-' + Date.now(),
-      sender: 'peer',
-      text,
-      timestamp: Date.now(),
-    };
-    this.chatMessages.push(msg);
-    this.chatListeners.forEach((cb) => cb(msg));
-  }
-
-  private updateStats(): void {
-    const rtt = Math.floor(18 + Math.random() * 12);
-    const packetsLost = Math.random() > 0.9 ? 1 : 0;
-    const stats: CallStats = {
-      resolution: this.hasVideo ? '1280x720 (30fps)' : 'Audio Only',
-      frameRate: this.hasVideo ? 30 : 0,
-      videoBitrate: this.hasVideo ? `${(1.2 + Math.random() * 0.4).toFixed(1)} Mbps` : '0 kbps',
-      audioBitrate: '64 kbps (Opus)',
-      packetsLost,
-      rtt,
-      codec: this.hasVideo ? 'VP8 / Opus' : 'Opus',
-    };
-    this.statsListeners.forEach((cb) => cb(stats));
+    }, 1200);
   }
 }
 

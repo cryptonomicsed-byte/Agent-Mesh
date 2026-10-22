@@ -1,22 +1,27 @@
 import { Contact, CallEvent, AppSettings } from '../types';
-import { generateRandomKey } from './crypto';
+import { generateIdentityKeyPairSync, derivePublicKey } from './crypto';
+import { DEFAULT_RELAY } from './nostr';
 
 const CONTACTS_STORAGE_KEY = 'meshenger_contacts_v1';
 const EVENTS_STORAGE_KEY = 'meshenger_events_v1';
 const SETTINGS_STORAGE_KEY = 'meshenger_settings_v1';
 
-const DEFAULT_SETTINGS: AppSettings = {
-  userName: 'My Meshenger Node',
-  publicKey: generateRandomKey(32),
-  privateKey: generateRandomKey(32),
-  listenPort: 10008,
-  addresses: ['192.168.1.105', 'fe80::4a2c:90ff:fed1:3321', 'mesh.local'],
-  activeAddresses: ['192.168.1.105', 'fe80::4a2c:90ff:fed1:3321'],
-  enableVideoDefault: true,
-  theme: 'dark',
-  ringtoneVolume: 0.8,
-  vibrate: true,
-};
+function makeDefaultSettings(): AppSettings {
+  const { publicKey, privateKey } = generateIdentityKeyPairSync();
+  return {
+    userName: 'My Node',
+    publicKey,
+    privateKey,
+    nostrRelays: [DEFAULT_RELAY],
+    listenPort: 10008,
+    addresses: [],
+    activeAddresses: [],
+    enableVideoDefault: true,
+    theme: 'dark',
+    ringtoneVolume: 0.8,
+    vibrate: true,
+  };
+}
 
 const SEED_CONTACTS: Contact[] = [
   {
@@ -69,13 +74,23 @@ class StorageService {
   getSettings(): AppSettings {
     const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
     if (!raw) {
-      this.saveSettings(DEFAULT_SETTINGS);
-      return { ...DEFAULT_SETTINGS };
+      const defaults = makeDefaultSettings();
+      this.saveSettings(defaults);
+      return defaults;
     }
     try {
-      return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+      const stored = JSON.parse(raw) as AppSettings;
+      // Ensure secp256k1 public key is consistent with stored private key
+      if (stored.privateKey?.length === 64) {
+        try { stored.publicKey = derivePublicKey(stored.privateKey); } catch {}
+      }
+      // Backfill nostrRelays if missing from old data
+      if (!stored.nostrRelays?.length) stored.nostrRelays = [DEFAULT_RELAY];
+      return stored;
     } catch {
-      return { ...DEFAULT_SETTINGS };
+      const defaults = makeDefaultSettings();
+      this.saveSettings(defaults);
+      return defaults;
     }
   }
 
@@ -160,15 +175,14 @@ class StorageService {
   }
 
   exportBackup(): string {
-    const data = {
+    return JSON.stringify({
       version: 1,
-      appName: 'Meshenger',
+      appName: 'Agent-Mesh',
       exportedAt: new Date().toISOString(),
       settings: this.getSettings(),
       contacts: this.getContacts(),
       events: this.getEvents(),
-    };
-    return JSON.stringify(data, null, 2);
+    }, null, 2);
   }
 
   importBackup(jsonString: string): { success: boolean; message: string } {

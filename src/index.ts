@@ -17,6 +17,9 @@ function initApp() {
   const root = document.getElementById('root');
   if (!root) return;
 
+  // Connect to Nostr relay for real call signaling
+  callManager.init();
+
   root.innerHTML = '';
   root.style.cssText = `
     display: flex;

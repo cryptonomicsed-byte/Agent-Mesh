@@ -7,8 +7,9 @@ export type ContactState =
 
 export interface Contact {
   name: string;
-  publicKey: string; // 64-char hex string
-  addresses: string[]; // IP addresses or domains
+  publicKey: string; // 64-char hex secp256k1 x-coordinate (Nostr pubkey)
+  addresses: string[]; // IP addresses or domains for direct mesh
+  relays?: string[]; // Nostr relay URLs this contact listens on
   blocked?: boolean;
   state?: ContactState;
   lastWorkingAddress?: string;
@@ -38,8 +39,9 @@ export interface CallEvent {
 
 export interface AppSettings {
   userName: string;
-  publicKey: string;
-  privateKey: string;
+  publicKey: string; // 64-char hex secp256k1 x-coordinate (Nostr pubkey)
+  privateKey: string; // 64-char hex secp256k1 secret key
+  nostrRelays: string[]; // Nostr relay URLs to use for signaling
   listenPort: number;
   addresses: string[]; // My detected & custom addresses
   activeAddresses: string[]; // Addresses included in my QR code

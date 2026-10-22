@@ -1,8 +1,10 @@
 /**
- * Meshenger Cryptographic Identity & Utility
- * Handles Ed25519-compatible 256-bit key representations,
- * fingerprints, and serialization.
+ * Cryptographic identity utilities for Agent-Mesh.
+ * Keys are secp256k1 (Nostr-native): private key = 32-byte scalar,
+ * public key = 32-byte x-coordinate, both stored as 64-char lowercase hex.
  */
+
+import { generateSecretKey, getPublicKey } from 'nostr-tools';
 
 export function byteArrayToHexString(byteArray: Uint8Array): string {
   return Array.from(byteArray, (byte) =>
@@ -33,32 +35,25 @@ export interface KeyPair {
   privateKey: string;
 }
 
-export async function generateIdentityKeyPair(): Promise<KeyPair> {
-  try {
-    // Generate an Ed25519 key pair if supported by Web Crypto
-    const keyPair = await crypto.subtle.generateKey(
-      {
-        name: 'Ed25519',
-      },
-      true,
-      ['sign', 'verify']
-    );
+/** Generate a secp256k1 keypair (Nostr-compatible). Synchronous via noble/curves. */
+export function generateIdentityKeyPairSync(): KeyPair {
+  const sk = generateSecretKey();
+  return {
+    privateKey: byteArrayToHexString(sk),
+    publicKey: getPublicKey(sk),
+  };
+}
 
-    const rawPub = await crypto.subtle.exportKey('raw', keyPair.publicKey);
-    const pkHex = byteArrayToHexString(new Uint8Array(rawPub));
-    // For storage, generate deterministic or random 32-byte representation
-    const privHex = generateRandomKey(32);
-    return {
-      publicKey: pkHex,
-      privateKey: privHex,
-    };
-  } catch {
-    // Fallback if Ed25519 is not exposed in this Web Crypto environment
-    return {
-      publicKey: generateRandomKey(32),
-      privateKey: generateRandomKey(32),
-    };
-  }
+/** Async wrapper kept for backwards compat. */
+export async function generateIdentityKeyPair(): Promise<KeyPair> {
+  return generateIdentityKeyPairSync();
+}
+
+/** Derive the secp256k1 public key from a hex private key. */
+export function derivePublicKey(privateKeyHex: string): string {
+  const skBytes = hexStringToByteArray(privateKeyHex);
+  if (!skBytes) throw new Error('invalid private key hex');
+  return getPublicKey(skBytes);
 }
 
 export function formatFingerprint(publicKeyHex: string): string {
