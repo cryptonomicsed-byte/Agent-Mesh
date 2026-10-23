@@ -44,6 +44,12 @@ class CallManager {
   private pendingOfferSdp: string | null = null;
   private isSimulated = false;
 
+  // ── ICE restart recovery ───────────────────────────────────────────────
+  private iceRestartInProgress = false;
+  private iceRestartAttempts = 0;
+  private readonly ICE_RESTART_MAX_ATTEMPTS = 3;
+  private iceDisconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
   // ── listeners ──────────────────────────────────────────────────────────
   private stateListeners: Set<CallStateListener> = new Set();
   private statsListeners: Set<StatsListener> = new Set();
@@ -264,19 +270,125 @@ class CallManager {
 
     pc.onconnectionstatechange = () => {
       const s = pc.connectionState;
-      if (s === 'failed' || s === 'closed') {
+      // 'failed' is handled via oniceconnectionstatechange below, which
+      // attempts an ICE restart before giving up. Only react to 'closed'
+      // here (explicit teardown) to avoid racing/duplicating that recovery.
+      if (s === 'closed') {
         this.endCall(this.currentState === 'connected' ? undefined : 'outgoing_error');
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      const s = pc.iceConnectionState;
+      console.info('[CallManager] iceConnectionState →', s);
+      if (s === 'disconnected') {
+        // 'disconnected' is often transient (brief network blip, Wi-Fi/
+        // cellular handoff) and can self-heal without intervention. Give it
+        // a short grace window before forcing an ICE restart.
+        if (this.iceDisconnectTimer) clearTimeout(this.iceDisconnectTimer);
+        this.iceDisconnectTimer = setTimeout(() => {
+          if (this.pc === pc && pc.iceConnectionState === 'disconnected') {
+            void this._attemptIceRestart();
+          }
+        }, 3000);
+      } else if (s === 'failed') {
+        if (this.iceDisconnectTimer) { clearTimeout(this.iceDisconnectTimer); this.iceDisconnectTimer = null; }
+        void this._attemptIceRestart();
+      } else if (s === 'connected' || s === 'completed') {
+        if (this.iceDisconnectTimer) { clearTimeout(this.iceDisconnectTimer); this.iceDisconnectTimer = null; }
+        this.iceRestartAttempts = 0; // reset backoff once the path is healthy again
       }
     };
 
     return pc;
   }
 
+  /**
+   * Recover from a failed/disconnected ICE path without tearing down the
+   * call: create a new offer with iceRestart:true, apply it locally, and
+   * re-signal it to the peer over Nostr using the same call_id. The peer's
+   * _onIncomingSignal recognizes the matching call_id as a renegotiation
+   * (not a new incoming call) and answers it, completing the restart.
+   */
+  private async _attemptIceRestart(): Promise<void> {
+    if (!this.pc || this.isSimulated || !this.activeCallId) return;
+    if (this.iceRestartInProgress) return; // one restart cycle in flight at a time
+    if (this.currentState !== 'connected') return; // only recover established calls
+
+    if (this.iceRestartAttempts >= this.ICE_RESTART_MAX_ATTEMPTS) {
+      console.warn('[CallManager] ICE restart attempts exhausted, ending call');
+      this.endCall(this.isIncoming ? 'incoming_error' : 'outgoing_error');
+      return;
+    }
+
+    this.iceRestartInProgress = true;
+    this.iceRestartAttempts++;
+    console.info(`[CallManager] attempting ICE restart (#${this.iceRestartAttempts})`);
+
+    try {
+      const offer = await this.pc.createOffer({ iceRestart: true });
+      await this.pc.setLocalDescription(offer);
+
+      const peerPk = this.isIncoming ? this.pendingCallerPk : this.currentContact?.publicKey;
+      if (peerPk && this.relay) {
+        const sent = this.relay.sendSignal(peerPk, {
+          type: 'offer',
+          call_id: this.activeCallId,
+          sdp: offer.sdp!,
+        });
+        if (!sent) {
+          // Relay socket was down when we tried to re-signal. NostrRelay
+          // queues the signal internally and flushes it automatically once
+          // the relay reconnects, so the restart offer isn't lost — it's
+          // just delayed until the transport comes back.
+          console.warn('[CallManager] ICE restart offer queued (relay disconnected); will send on reconnect');
+        }
+      } else {
+        console.warn('[CallManager] ICE restart: no peer pubkey/relay available to re-signal');
+      }
+    } catch (err) {
+      console.warn('[CallManager] ICE restart offer failed:', err);
+    } finally {
+      this.iceRestartInProgress = false;
+    }
+  }
+
+  /**
+   * Handle a mid-call renegotiation offer from the peer (their side of an
+   * ICE restart, triggered by _attemptIceRestart on their end). Applies the
+   * new SDP, answers it, and sends the answer back — the call_id matches
+   * our already-active call, so this never creates a new ringing state.
+   */
+  private async _handleRenegotiationOffer(signal: SignalPayload, senderPk: string): Promise<void> {
+    if (!this.pc || !signal.sdp || !this.activeCallId) return;
+    try {
+      await this.pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: signal.sdp }));
+      const answer = await this.pc.createAnswer();
+      await this.pc.setLocalDescription(answer);
+      if (this.relay) {
+        const sent = this.relay.sendSignal(senderPk, {
+          type: 'answer',
+          call_id: this.activeCallId,
+          sdp: answer.sdp!,
+        });
+        if (!sent) {
+          console.warn('[CallManager] ICE restart answer queued (relay disconnected); will send on reconnect');
+        }
+      }
+    } catch (err) {
+      console.warn('[CallManager] ICE restart renegotiation (offer→answer) failed:', err);
+    }
+  }
+
   private _closePeerConnection(): void {
+    if (this.iceDisconnectTimer) { clearTimeout(this.iceDisconnectTimer); this.iceDisconnectTimer = null; }
+    this.iceRestartInProgress = false;
+    this.iceRestartAttempts = 0;
     if (this.pc) {
       this.pc.onicecandidate = null;
       this.pc.ontrack = null;
       this.pc.onconnectionstatechange = null;
+      this.pc.oniceconnectionstatechange = null;
       this.pc.close();
       this.pc = null;
     }
@@ -286,7 +398,23 @@ class CallManager {
 
   private _onIncomingSignal(signal: SignalPayload, senderPk: string): void {
     if (signal.type === 'offer') {
-      if (this.currentState !== 'idle') return; // already in a call
+      // Mid-call renegotiation: the peer is performing an ICE restart on an
+      // already-active call (same call_id). Must NOT be treated as a new
+      // incoming call / routed into the 'ringing' flow — answer it in place.
+      if (
+        signal.call_id === this.activeCallId &&
+        this.currentState === 'connected' &&
+        !this.isSimulated &&
+        this.pc
+      ) {
+        const expectedPeerPk = this.isIncoming ? this.pendingCallerPk : this.currentContact?.publicKey;
+        if (expectedPeerPk && senderPk.toLowerCase() === expectedPeerPk.toLowerCase()) {
+          void this._handleRenegotiationOffer(signal, senderPk);
+        }
+        return;
+      }
+
+      if (this.currentState !== 'idle') return; // already in a (different) call
       this.pendingCallerPk = senderPk;
       this.activeCallId = signal.call_id;
       this.pendingOfferSdp = signal.sdp ?? null;
