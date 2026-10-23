@@ -1,6 +1,6 @@
-import { Contact, AppSettings } from '../types';
-import { renderQRToCanvas, scanCanvasForQR, scanImageFileForQR, parseContactPayload } from '../services/qr';
-import { formatFingerprint, generateIdentityKeyPairSync, derivePublicKey } from '../services/crypto';
+import { Contact, AppSettings, NearbyPeer } from '../types';
+import { renderQRToCanvas, scanCanvasForQR, scanImageFileForQR, parseContactPayload, buildInviteLink } from '../services/qr';
+import { formatFingerprint, generateIdentityKeyPairSync, derivePublicKey, generateRandomKey } from '../services/crypto';
 import { nip19 } from 'nostr-tools';
 import { storage } from '../services/storage';
 import { audioSynth } from '../services/audioSynthesizer';
@@ -114,9 +114,31 @@ export function showMyQRModal(settings: AppSettings, onSaveAddresses: () => void
         Save Image
       </button>
     </div>
+
+    <div style="margin-top: 4px;">
+      <div style="font-size: 12px; font-weight: 600; color: #ccc; margin-bottom: 6px;">
+        Invite Link <span style="color: #777; font-weight: 400;">(no camera needed — paste into chat, email, etc.)</span>
+      </div>
+      <div style="display: flex; gap: 8px;">
+        <input id="invite-link-text" readonly class="font-mono" style="flex: 1; font-size: 11px; color: #a7f3d0; background: #141414; border: 1px solid #282828;" />
+        <button id="btn-copy-invite" style="padding: 8px 14px; background: #262626; color: #fff; border: 1px solid #444; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap;">
+          Copy
+        </button>
+      </div>
+    </div>
   `;
 
   content.appendChild(details);
+
+  // Invite link (NIP-19 npub/nprofile deep link — lower-effort complement to QR scanning)
+  const inviteLinkInput = details.querySelector('#invite-link-text') as HTMLInputElement;
+  inviteLinkInput.value = buildInviteLink(settings.publicKey, settings.nostrRelays);
+  details.querySelector('#btn-copy-invite')?.addEventListener('click', () => {
+    navigator.clipboard.writeText(inviteLinkInput.value);
+    const btn = details.querySelector('#btn-copy-invite') as HTMLButtonElement;
+    btn.textContent = 'Copied!';
+    setTimeout(() => (btn.textContent = 'Copy'), 2000);
+  });
 
   // Address checkbox changes
   details.querySelectorAll('#qr-address-checkboxes input[type="checkbox"]').forEach((input) => {
@@ -469,6 +491,16 @@ export function showSettingsModal(settings: AppSettings, onUpdated: () => void):
       <input id="settings-video" type="checkbox" ${settings.enableVideoDefault ? 'checked' : ''} style="cursor: pointer; width: 18px; height: 18px;" />
     </div>
 
+    <div style="display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-top: 1px solid #262626; margin-top: 4px;">
+      <div style="max-width: 360px;">
+        <div style="font-size: 13px; font-weight: 600; color: #fff;">Discoverable on Nearby Mesh</div>
+        <div style="font-size: 12px; color: #777; margin-top: 2px;">
+          When on, broadcasts your name/pubkey/address on the local relay so other Agent-Mesh nodes nearby can find you without scanning a QR code. Off by default for privacy.
+        </div>
+      </div>
+      <input id="settings-discoverable" type="checkbox" ${settings.discoverable ? 'checked' : ''} style="cursor: pointer; width: 18px; height: 18px; flex-shrink: 0; margin-left: 12px;" />
+    </div>
+
     <div>
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
         <label style="font-size: 13px; font-weight: 600; color: #ccc;">Ringtone Volume</label>
@@ -601,6 +633,7 @@ export function showSettingsModal(settings: AppSettings, onUpdated: () => void):
     settings.turnCredsUrl = (content.querySelector('#settings-turn-url') as HTMLInputElement).value.trim();
     settings.listenPort = parseInt((content.querySelector('#settings-port') as HTMLInputElement).value, 10) || 10008;
     settings.enableVideoDefault = (content.querySelector('#settings-video') as HTMLInputElement).checked;
+    settings.discoverable = (content.querySelector('#settings-discoverable') as HTMLInputElement).checked;
     settings.ringtoneVolume = parseFloat((content.querySelector('#settings-volume') as HTMLInputElement).value);
     storage.saveSettings(settings);
     onUpdated();
@@ -652,5 +685,91 @@ export function showAboutModal(): void {
   `;
 
   content.querySelector('#btn-close-about')?.addEventListener('click', () => backdrop.remove());
+  document.body.appendChild(backdrop);
+}
+
+/**
+ * 6. Nearby Devices Modal (opt-in local-mesh discovery, MKD-20)
+ *
+ * Surfaces peers announcing themselves on the "nearby announce" relay topic
+ * (see src/services/discovery.ts) while discovery is enabled in Settings.
+ * Discovery only *finds* — nothing is auto-added; the user must explicitly
+ * tap "Add Contact" per peer, same trust gate as a scanned QR code.
+ */
+export function showNearbyDevicesModal(
+  settings: AppSettings,
+  discovery: { getPeers: () => NearbyPeer[]; onPeersChanged: (cb: (peers: NearbyPeer[]) => void) => () => void },
+  onAddContact: (contact: Contact) => void
+): void {
+  const { backdrop, content } = createModalWrapper('Nearby Devices', () => {
+    unsubscribe();
+    backdrop.remove();
+  });
+
+  const list = document.createElement('div');
+  list.style.cssText = `display: flex; flex-direction: column; gap: 10px;`;
+
+  function render(peers: NearbyPeer[]) {
+    if (!settings.discoverable) {
+      list.innerHTML = `
+        <div style="text-align: center; padding: 28px 16px; background: #1a1a1a; border-radius: 12px; border: 1px dashed #333;">
+          <p style="font-size: 13px; color: #aaa;">Nearby discovery is off. Turn on "Discoverable on Nearby Mesh" in Settings to broadcast and listen for other nodes on your relay.</p>
+        </div>
+      `;
+      return;
+    }
+    if (peers.length === 0) {
+      list.innerHTML = `
+        <div style="text-align: center; padding: 28px 16px; background: #1a1a1a; border-radius: 12px; border: 1px dashed #333;">
+          <p style="font-size: 13px; color: #aaa;">No other nodes seen yet. Keep this open while another discoverable node starts up nearby.</p>
+        </div>
+      `;
+      return;
+    }
+    list.innerHTML = '';
+    peers.forEach((peer) => {
+      const row = document.createElement('div');
+      row.style.cssText = `
+        background: #1c1c1c; border: 1px solid #2b2b2b; border-radius: 12px; padding: 12px 14px;
+        display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      `;
+      row.innerHTML = `
+        <div style="min-width: 0;">
+          <div style="font-weight: 600; font-size: 14px; color: #fff;">${peer.name}</div>
+          <div class="font-mono" style="font-size: 11px; color: #6ee7b7;">${formatFingerprint(peer.publicKey)}</div>
+          <div style="font-size: 11px; color: #888; margin-top: 2px;">${peer.addresses.join(', ') || 'No address announced'}</div>
+        </div>
+        <button class="btn-add-peer" style="padding: 8px 14px; background: #22c55e; color: #000; font-weight: 700; border-radius: 8px; font-size: 12px; cursor: pointer; white-space: nowrap;">
+          Add Contact
+        </button>
+      `;
+      row.querySelector('.btn-add-peer')?.addEventListener('click', () => {
+        const contact: Contact = {
+          name: peer.name,
+          publicKey: peer.publicKey,
+          addresses: peer.addresses,
+          ...(peer.relays?.length ? { relays: peer.relays } : {}),
+          state: 'online',
+          addedAt: Date.now(),
+        };
+        storage.addContact(contact);
+        onAddContact(contact);
+        (row.querySelector('.btn-add-peer') as HTMLButtonElement).textContent = 'Added ✓';
+        (row.querySelector('.btn-add-peer') as HTMLButtonElement).disabled = true;
+      });
+      list.appendChild(row);
+    });
+  }
+
+  content.innerHTML = `
+    <p style="font-size: 13px; color: #aaa; margin: 0;">
+      Nodes that have opted in to "Discoverable on Nearby Mesh" and are on the same relay as you show up here automatically — no QR scan needed.
+    </p>
+  `;
+  content.appendChild(list);
+
+  render(discovery.getPeers());
+  const unsubscribe = discovery.onPeersChanged(render);
+
   document.body.appendChild(backdrop);
 }

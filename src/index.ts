@@ -6,12 +6,14 @@ import { createContactList } from './components/ContactList';
 import { createCallHistory } from './components/CallHistory';
 import { createCallScreen } from './components/CallScreen';
 import { showLoginScreen } from './components/LoginScreen';
+import { createDiscoveryService, NearbyDiscoveryService } from './services/discovery';
 import {
   showMyQRModal,
   showScanQRModal,
   showAddContactModal,
   showSettingsModal,
   showAboutModal,
+  showNearbyDevicesModal,
 } from './components/Modals';
 
 function initApp() {
@@ -76,6 +78,26 @@ function launchMain(root: HTMLElement, sessionKey: string) {
   let contacts = storage.getContacts();
   let events = storage.getEvents();
 
+  // Opt-in "nearby" discovery (MKD-20): only ever runs while
+  // settings.discoverable is true, and is torn down on logout.
+  let discovery: NearbyDiscoveryService | null = null;
+  function syncDiscovery() {
+    if (settings.discoverable) {
+      if (!discovery) {
+        discovery = createDiscoveryService(
+          settings.nostrRelays[0] || 'wss://omokoda.duckdns.org:3443',
+          settings.privateKey,
+          () => ({ name: settings.userName, addresses: settings.activeAddresses, relays: settings.nostrRelays })
+        );
+        discovery.start();
+      }
+    } else if (discovery) {
+      discovery.stop();
+      discovery = null;
+    }
+  }
+  syncDiscovery();
+
   // Create active call screen overlay
   const callScreen = createCallScreen();
   document.body.appendChild(callScreen.element);
@@ -124,10 +146,25 @@ function launchMain(root: HTMLElement, sessionKey: string) {
     onSettings: () =>
       showSettingsModal(settings, () => {
         settings = storage.getSettings();
+        syncDiscovery();
         refreshData();
       }),
     onAbout: () => showAboutModal(),
+    onShowNearby: () => {
+      if (!discovery) {
+        showToast('Turn on "Discoverable on Nearby Mesh" in Settings first');
+        return;
+      }
+      showNearbyDevicesModal(settings, discovery, (c) => {
+        showToast(`Added contact: ${c.name}`);
+        refreshData();
+      });
+    },
     onLogout: () => {
+      if (discovery) {
+        discovery.stop();
+        discovery = null;
+      }
       callManager.logout();
       sessionStorage.removeItem(sessionKey);
       root.innerHTML = '';
