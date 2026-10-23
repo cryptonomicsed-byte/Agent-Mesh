@@ -44,6 +44,7 @@ export function createCallScreen(): {
           </span>
         </div>
         <div style="display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 13px;">
+          <svg id="call-status-spinner" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="3" stroke-linecap="round" class="call-state-ring-connecting" style="display: none;"><path d="M12 2a10 10 0 0 1 10 10" /></svg>
           <span id="call-status-text" style="color: #4ade80; font-weight: 600;">Connecting…</span>
           <span id="call-duration-timer" style="color: #aaa; font-family: monospace; display: none;">00:00</span>
           <span id="call-address-text" class="font-mono" style="color: #888; font-size: 12px;"></span>
@@ -199,6 +200,7 @@ export function createCallScreen(): {
   // Elements
   const contactNameEl = overlay.querySelector('#call-contact-name') as HTMLElement;
   const statusTextEl = overlay.querySelector('#call-status-text') as HTMLElement;
+  const statusSpinnerEl = overlay.querySelector('#call-status-spinner') as HTMLElement;
   const durationTimerEl = overlay.querySelector('#call-duration-timer') as HTMLElement;
   const addressTextEl = overlay.querySelector('#call-address-text') as HTMLElement;
   const remoteVideo = overlay.querySelector('#remote-video') as HTMLVideoElement;
@@ -322,20 +324,32 @@ export function createCallScreen(): {
       incomingContactName.textContent = name;
       incomingAddress.textContent = addr;
 
+      // Spinner shows during any transitional state (calling/ringing) and hides once
+      // the call lands on a terminal-ish state (connected/ended), giving a clear
+      // "working on it" -> "done" visual beat instead of text-only state changes.
+      if (state === 'ringing' || state === 'calling') {
+        statusSpinnerEl.style.display = 'inline-block';
+      } else {
+        statusSpinnerEl.style.display = 'none';
+      }
+
       if (state === 'ringing') {
         if (callManager.getIsIncoming()) {
           incomingRingCard.style.display = 'flex';
           callControlsBar.style.display = 'none';
           statusTextEl.textContent = 'Incoming Call…';
+          statusTextEl.style.color = '#4ade80';
         } else {
           incomingRingCard.style.display = 'none';
           callControlsBar.style.display = 'flex';
           statusTextEl.textContent = 'Ringing…';
+          statusTextEl.style.color = '#4ade80';
         }
       } else if (state === 'calling') {
         incomingRingCard.style.display = 'none';
         callControlsBar.style.display = 'flex';
         statusTextEl.textContent = 'Calling…';
+        statusTextEl.style.color = '#4ade80';
       } else if (state === 'connected') {
         incomingRingCard.style.display = 'none';
         callControlsBar.style.display = 'flex';
