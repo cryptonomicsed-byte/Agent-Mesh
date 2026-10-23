@@ -50,6 +50,16 @@ export interface AppSettings {
   theme: 'dark' | 'light';
   ringtoneVolume: number;
   vibrate: boolean;
+  discoverable: boolean; // opt-in: broadcast presence on the "nearby announce" Nostr topic for local-network discovery
+}
+
+/** A peer discovered via the local-network "nearby announce" topic, not yet added as a contact. */
+export interface NearbyPeer {
+  publicKey: string;
+  name: string;
+  addresses: string[];
+  relays: string[];
+  lastSeen: number;
 }
 
 export type ActiveCallState = 

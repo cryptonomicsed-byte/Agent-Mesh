@@ -21,6 +21,7 @@ function makeDefaultSettings(): AppSettings {
     theme: 'dark',
     ringtoneVolume: 0.8,
     vibrate: true,
+    discoverable: false,
   };
 }
 
@@ -54,6 +55,8 @@ class StorageService {
       // Backfill fields missing from old data
       if (!stored.nostrRelays?.length) stored.nostrRelays = [DEFAULT_RELAY];
       if (stored.turnCredsUrl === undefined) stored.turnCredsUrl = '';
+      // Privacy-respecting default: discovery is OFF unless the user previously opted in.
+      if (stored.discoverable === undefined) stored.discoverable = false;
       return stored;
     } catch {
       const defaults = makeDefaultSettings();
