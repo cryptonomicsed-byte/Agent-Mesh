@@ -95,6 +95,20 @@ export function decryptSignalEvent(
 export const DEFAULT_RELAY = 'wss://omokoda.duckdns.org:3443';
 export const FALLBACK_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol'];
 
+// Max time (ms) a queued outbound signal is kept waiting for the relay to come back.
+// ICE candidates/answers older than this are almost certainly stale (call already ended/timed out).
+const OUTBOX_MAX_AGE_MS = 120_000;
+// Cap on queued outbound signals so a long outage can't grow this unbounded.
+const OUTBOX_MAX_SIZE = 200;
+// Cap on dedup cache of recently-seen inbound event ids (bounded FIFO).
+const SEEN_EVENTS_MAX = 500;
+
+interface QueuedSignal {
+  recipientPk: PubKeyHex;
+  signal: SignalPayload;
+  queuedAt: number;
+}
+
 export class NostrRelay {
   readonly ourPk: PubKeyHex;
   private ws: WebSocket | null = null;
@@ -104,6 +118,15 @@ export class NostrRelay {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private signalHandlers: Array<(s: IncomingSignal) => void> = [];
   private statusHandlers: Array<(connected: boolean) => void> = [];
+  // Outbound signals (notably ICE candidates generated while the relay socket
+  // was down) that failed to send and are waiting to be flushed on reconnect.
+  private pendingOutbox: QueuedSignal[] = [];
+  // When we last went offline — used to widen the replay window on reconnect
+  // so signals published by the peer during our downtime aren't missed.
+  private lastDisconnectedAt: number | null = null;
+  // Dedup cache: avoids re-processing the same signal twice when a widened
+  // replay window re-delivers events we already handled before the drop.
+  private seenEventIds: Set<string> = new Set();
 
   constructor(
     private readonly url: string,
@@ -152,12 +175,26 @@ export class NostrRelay {
 
       ws.onopen = () => {
         this.reconnectMs = 2000;
-        const since = Math.floor(Date.now() / 1000) - 300;
+        // Widen the replay window to cover however long we were actually
+        // disconnected (not just a fixed 300s) so signals — in particular
+        // ICE candidates the peer sent to the relay while we were down —
+        // get replayed to us instead of being silently lost on reconnect.
+        // Floored at 300s (first-connect default) and capped at 1h so a
+        // long outage can't trigger an unbounded relay query.
+        const outageSec = this.lastDisconnectedAt
+          ? Math.ceil((Date.now() - this.lastDisconnectedAt) / 1000)
+          : 0;
+        const windowSec = Math.min(Math.max(300, outageSec + 60), 3600);
+        const since = Math.floor(Date.now() / 1000) - windowSec;
+        this.lastDisconnectedAt = null;
         ws.send(JSON.stringify([
           'REQ', this.subId,
           { kinds: [1059], '#p': [this.ourPk], since },
         ]));
         this.statusHandlers.forEach(h => h(true));
+        // Flush anything we queued while disconnected (e.g. ICE candidates
+        // generated mid-call that failed to send because the socket was down).
+        this._flushOutbox();
       };
 
       ws.onmessage = (e: MessageEvent) => {
@@ -171,6 +208,7 @@ export class NostrRelay {
 
       ws.onerror = () => {};
       ws.onclose = () => {
+        this.lastDisconnectedAt = Date.now();
         this.statusHandlers.forEach(h => h(false));
         if (!this.closed) {
           this.reconnectTimer = setTimeout(() => {
@@ -184,6 +222,17 @@ export class NostrRelay {
 
   private _handleEvent(event: Record<string, unknown>): void {
     if (event.kind !== 1059) return;
+    // Dedup: a widened replay window on reconnect (see onopen above) can
+    // re-deliver an event we already processed before the relay dropped us.
+    const id = typeof event.id === 'string' ? event.id : undefined;
+    if (id) {
+      if (this.seenEventIds.has(id)) return;
+      this.seenEventIds.add(id);
+      if (this.seenEventIds.size > SEEN_EVENTS_MAX) {
+        const oldest = this.seenEventIds.values().next().value;
+        if (oldest !== undefined) this.seenEventIds.delete(oldest);
+      }
+    }
     try {
       const { plaintext, senderPk } = decryptSignalEvent(
         event as { pubkey: string; content: string },
@@ -195,15 +244,43 @@ export class NostrRelay {
     } catch {}
   }
 
+  /**
+   * Send a signal immediately if connected. If the socket is down (or the
+   * send throws), the signal is queued and automatically retried the next
+   * time the relay reconnects — this is what prevents ICE candidates (and
+   * other mid-call signals) generated during a relay drop from being
+   * silently lost instead of just delayed.
+   */
   sendSignal(recipientPk: PubKeyHex, signal: SignalPayload): boolean {
-    if (!this.isConnected) return false;
-    try {
-      const event = buildSignalEvent(this.ourSk, recipientPk, JSON.stringify(signal));
-      this.ws!.send(JSON.stringify(['EVENT', event]));
-      return true;
-    } catch (err) {
-      console.warn('[NostrRelay] send failed:', err);
-      return false;
+    if (this.isConnected) {
+      try {
+        const event = buildSignalEvent(this.ourSk, recipientPk, JSON.stringify(signal));
+        this.ws!.send(JSON.stringify(['EVENT', event]));
+        return true;
+      } catch (err) {
+        console.warn('[NostrRelay] send failed, queueing for retry:', err);
+      }
+    }
+    this._enqueueOutbox(recipientPk, signal);
+    return false;
+  }
+
+  private _enqueueOutbox(recipientPk: PubKeyHex, signal: SignalPayload): void {
+    this.pendingOutbox.push({ recipientPk, signal, queuedAt: Date.now() });
+    if (this.pendingOutbox.length > OUTBOX_MAX_SIZE) {
+      this.pendingOutbox.splice(0, this.pendingOutbox.length - OUTBOX_MAX_SIZE);
+    }
+  }
+
+  private _flushOutbox(): void {
+    if (!this.pendingOutbox.length) return;
+    const now = Date.now();
+    const toSend = this.pendingOutbox.filter(item => now - item.queuedAt < OUTBOX_MAX_AGE_MS);
+    this.pendingOutbox = [];
+    for (const item of toSend) {
+      // Re-run through sendSignal: if we're truly connected this sends now;
+      // if the socket flapped again immediately it re-queues rather than drops.
+      this.sendSignal(item.recipientPk, item.signal);
     }
   }
 }
