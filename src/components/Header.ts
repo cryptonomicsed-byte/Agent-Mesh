@@ -10,6 +10,7 @@ export function createHeader(
     onSettings: () => void;
     onAbout: () => void;
     onLogout: () => void;
+    onShowNearby: () => void;
   }
 ): { element: HTMLElement; setRelayStatus: (connected: boolean) => void } {
   const header = document.createElement('header');
@@ -76,6 +77,15 @@ export function createHeader(
         <span class="btn-text">Scan</span>
       </button>
 
+      <button id="btn-nearby" title="Nearby Devices (opt-in local discovery)" style="
+        display: flex; align-items: center; gap: 6px; padding: 7px 12px; background: #242424; color: ${settings.discoverable ? '#60a5fa' : '#888'}; border: 1px solid ${settings.discoverable ? '#60a5fa50' : '#3a3a3a'}; border-radius: 8px; font-size: 13px; font-weight: 500; cursor: pointer;
+      ">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12" y2="20"/>
+        </svg>
+        <span class="btn-text">Nearby</span>
+      </button>
+
       <button id="btn-settings" title="Settings" style="
         padding: 8px; background: #242424; color: #ccc; border: 1px solid #3a3a3a; border-radius: 8px; display: flex; align-items: center; justify-content: center; cursor: pointer;
       ">
@@ -108,6 +118,7 @@ export function createHeader(
   header.querySelector('#btn-simulate-call')?.addEventListener('click', handlers.onSimulateCall);
   header.querySelector('#btn-show-my-qr')?.addEventListener('click', handlers.onShowMyQR);
   header.querySelector('#btn-scan-qr')?.addEventListener('click', handlers.onScanQR);
+  header.querySelector('#btn-nearby')?.addEventListener('click', handlers.onShowNearby);
   header.querySelector('#btn-settings')?.addEventListener('click', handlers.onSettings);
   header.querySelector('#btn-about')?.addEventListener('click', handlers.onAbout);
   header.querySelector('#btn-logout')?.addEventListener('click', handlers.onLogout);

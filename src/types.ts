@@ -50,6 +50,11 @@ export interface AppSettings {
   theme: 'dark' | 'light';
   ringtoneVolume: number;
   vibrate: boolean;
+  // Opt-in "nearby" discovery (v0.2): when true, this node periodically
+  // broadcasts an ephemeral "I am pubkey X at address Y" announce event
+  // over its configured Nostr relay(s) and listens for the same from other
+  // nodes, so new peers on the same relay/mesh can find each other without
+  // a manual QR exchange. Off by default — privacy-respecting opt-in.
   discoverable: boolean; // opt-in: broadcast presence on the "nearby announce" Nostr topic for local-network discovery
 }
 
