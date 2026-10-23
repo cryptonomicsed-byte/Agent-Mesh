@@ -131,7 +131,12 @@ class CallManager {
   private notifyMedia(): void {
     this.mediaListeners.forEach(cb => cb(this.localStream, this.remoteStream));
   }
-  private _showCallError(message: string): void {
+  /**
+   * Show an error toast. When `showReconnect` is true, renders a "Reconnect" button
+   * that re-runs relay init() in place — so the user doesn't have to hunt for
+   * Settings / go-offline-then-online to recover from a dropped relay connection.
+   */
+  private _showCallError(message: string, showReconnect = false): void {
     const existing = document.getElementById('call-error-toast');
     if (existing) existing.remove();
     const toast = document.createElement('div');
@@ -139,15 +144,50 @@ class CallManager {
     toast.style.cssText = `
       position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
       background: #3d1515; border: 1px solid #7f1d1d; color: #fca5a5;
-      padding: 12px 20px; border-radius: 12px; font-size: 13px; font-weight: 500;
+      padding: 12px 16px; border-radius: 12px; font-size: 13px; font-weight: 500;
       box-shadow: 0 8px 30px rgba(0,0,0,0.6); z-index: 2000;
-      display: flex; align-items: center; gap: 10px; max-width: 90vw;
+      display: flex; align-items: center; gap: 12px; max-width: 90vw;
     `;
     toast.innerHTML = `
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
       <span>${message}</span>
+      ${showReconnect ? `
+        <button id="call-error-reconnect-btn" style="
+          flex-shrink: 0; padding: 6px 12px; background: #7f1d1d; color: #fff5f5;
+          border: 1px solid #991b1b; border-radius: 8px; font-size: 12px; font-weight: 700;
+          cursor: pointer; white-space: nowrap;
+        ">Reconnect</button>
+      ` : ''}
     `;
     document.body.appendChild(toast);
+
+    const reconnectBtn = toast.querySelector('#call-error-reconnect-btn') as HTMLButtonElement | null;
+    if (reconnectBtn) {
+      reconnectBtn.addEventListener('click', () => {
+        reconnectBtn.disabled = true;
+        reconnectBtn.textContent = 'Reconnecting…';
+        this.init();
+        // Give the relay a moment to handshake, then report the outcome in-place.
+        setTimeout(() => {
+          if (this.isRelayConnected()) {
+            reconnectBtn.textContent = 'Connected ✓';
+            (toast.querySelector('span') as HTMLElement).textContent = 'Back online — reconnected to relay.';
+            toast.style.background = '#13291c';
+            toast.style.border = '1px solid #166534';
+            toast.style.color = '#86efac';
+            reconnectBtn.style.background = '#166534';
+            reconnectBtn.style.border = '1px solid #22c55e';
+            setTimeout(() => toast.remove(), 2500);
+          } else {
+            reconnectBtn.disabled = false;
+            reconnectBtn.textContent = 'Reconnect';
+            (toast.querySelector('span') as HTMLElement).textContent = 'Still offline. Check Settings → Nostr Signalling Relays, or try again.';
+          }
+        }, 2500);
+      });
+      // Don't auto-dismiss while an action is offered — let the user act or close it.
+      return;
+    }
     setTimeout(() => toast.remove(), 5000);
   }
 
@@ -351,7 +391,7 @@ class CallManager {
     if (this.currentState !== 'idle') return;
 
     if (!this.relay?.isConnected) {
-      this._showCallError(`Not connected to relay — go offline then back online`);
+      this._showCallError(`Not connected to relay — can't place calls right now.`, true);
       return;
     }
 
@@ -390,7 +430,7 @@ class CallManager {
         sendToRelays(contactRelays, sk, contact.publicKey, offerSignal);
       }
       if (!sent && !contactRelays.length) {
-        this._showCallError('Could not reach relay. Check your connection.');
+        this._showCallError('Could not reach relay — your call could not be delivered.', true);
         this.endCall('outgoing_error');
         return;
       }

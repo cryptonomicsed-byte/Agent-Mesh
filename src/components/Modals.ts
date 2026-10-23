@@ -479,6 +479,15 @@ export function showSettingsModal(settings: AppSettings, onUpdated: () => void):
 
     <div style="height: 1px; background: #333; margin: 6px 0;"></div>
 
+    <!-- Safety framing: the backup file IS the user's identity (private key + contacts). -->
+    <div style="background: #241a0d; border: 1px solid #7c4a0f60; border-radius: 10px; padding: 10px 12px; font-size: 11.5px; color: #e8b979; line-height: 1.5;">
+      <strong style="color: #fbbf24;">&#9888; This backup file is your identity.</strong> It contains your private key
+      in plain text — anyone who gets this file can impersonate you and read your contacts. There is no "forgot
+      password" recovery: if you lose both your device and this file, your Mesh Address is gone for good. Store
+      it somewhere only you control (encrypted drive, password manager, offline media) — never email or cloud-sync
+      it unencrypted.
+    </div>
+
     <div style="display: flex; gap: 10px;">
       <button id="btn-backup-export" style="flex: 1; padding: 10px; background: #262626; color: #fff; border: 1px solid #444; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer;">
         Export Backup
@@ -488,6 +497,7 @@ export function showSettingsModal(settings: AppSettings, onUpdated: () => void):
       </button>
       <input id="file-import-backup" type="file" accept=".json" style="display: none;" />
     </div>
+    <div style="font-size: 10.5px; color: #666; margin-top: -4px;">Importing replaces your current identity, contacts, and settings — this cannot be undone.</div>
 
     <button id="btn-save-settings" style="
       margin-top: 10px; padding: 12px; background: #22c55e; color: #000; font-weight: 700; border-radius: 10px; font-size: 14px; cursor: pointer;
@@ -572,7 +582,12 @@ export function showSettingsModal(settings: AppSettings, onUpdated: () => void):
 
   // Import Backup
   const fileImport = content.querySelector('#file-import-backup') as HTMLInputElement;
-  content.querySelector('#btn-backup-import')?.addEventListener('click', () => fileImport.click());
+  content.querySelector('#btn-backup-import')?.addEventListener('click', () => {
+    if (!confirm('Import backup? This replaces your current identity, contacts, and settings on this device — your current Mesh Address will no longer work unless you have it backed up separately. This cannot be undone.')) {
+      return;
+    }
+    fileImport.click();
+  });
   fileImport.addEventListener('change', (e) => {
     const file = (e.target as HTMLInputElement).files?.[0];
     if (file) {
@@ -581,11 +596,11 @@ export function showSettingsModal(settings: AppSettings, onUpdated: () => void):
         const text = re.target?.result as string;
         const res = storage.importBackup(text);
         if (res.success) {
-          alert('Backup restored successfully!');
+          alert('Backup restored successfully! Your identity, contacts, and settings have been replaced.');
           onUpdated();
           backdrop.remove();
         } else {
-          alert(res.message);
+          alert(`Import failed: ${res.message}\n\nYour current identity was not changed.`);
         }
       };
       reader.readAsText(file);
