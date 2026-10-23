@@ -1,3 +1,4 @@
+import { EncryptedPrivateKey } from "./services/secureStorage";
 export type ContactState = 
   | 'online' 
   | 'offline' 
@@ -40,7 +41,8 @@ export interface CallEvent {
 export interface AppSettings {
   userName: string;
   publicKey: string; // 64-char hex secp256k1 x-coordinate (Nostr pubkey)
-  privateKey: string; // 64-char hex secp256k1 secret key
+  privateKey: string; // 64-char hex secp256k1 secret key — will be absent once vault is locked
+  encryptedPrivateKey?: EncryptedPrivateKey; // present when key is encrypted at rest
   nostrRelays: string[]; // Nostr relay URLs to use for signaling
   turnCredsUrl: string; // Public HTTPS URL for TURN credentials (e.g. https://vantage-host/api/turn-creds)
   listenPort: number;

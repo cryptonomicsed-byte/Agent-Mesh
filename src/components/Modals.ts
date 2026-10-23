@@ -1,6 +1,6 @@
 import { Contact, AppSettings } from '../types';
 import { renderQRToCanvas, scanCanvasForQR, scanImageFileForQR, parseContactPayload } from '../services/qr';
-import { formatFingerprint, generateIdentityKeyPairSync, derivePublicKey } from '../services/crypto';
+import { formatFingerprint, generateIdentityKeyPairSync, derivePublicKey, generateRandomKey } from '../services/crypto';
 import { nip19 } from 'nostr-tools';
 import { storage } from '../services/storage';
 import { audioSynth } from '../services/audioSynthesizer';
