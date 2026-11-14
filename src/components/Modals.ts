@@ -356,7 +356,6 @@ export function showAddContactModal(onAdded: (contact: Contact) => void): void {
     <div>
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
         <label style="font-size: 13px; font-weight: 600; color: #ccc;">Public Key (256-bit Hex)</label>
-        <button id="btn-gen-key" style="font-size: 11px; color: #4ade80; cursor: pointer;">Generate Key</button>
       </div>
       <input id="add-key" type="text" placeholder="64-character hex public key…" class="font-mono" style="width: 100%; font-size: 12px;" />
     </div>
@@ -373,10 +372,6 @@ export function showAddContactModal(onAdded: (contact: Contact) => void): void {
       Save Contact
     </button>
   `;
-
-  content.querySelector('#btn-gen-key')?.addEventListener('click', () => {
-    (content.querySelector('#add-key') as HTMLInputElement).value = generateRandomKey(32);
-  });
 
   content.querySelector('#btn-save-contact')?.addEventListener('click', () => {
     const name = (content.querySelector('#add-name') as HTMLInputElement).value.trim();

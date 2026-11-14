@@ -1,3 +1,4 @@
+import { IS_DEV } from './env';
 import { storage } from './services/storage';
 import { callManager } from './services/callManager';
 import { Contact } from './types';
@@ -118,7 +119,7 @@ function launchMain(root: HTMLElement, sessionKey: string) {
         refreshData();
       }),
     onSimulateCall: () => {
-      callManager.simulateIncomingCall(contacts[0]);
+      callManager.simulateIncomingCall(contacts[0]);   // development builds only
     },
     onAddressManagement: () => showMyQRModal(settings, () => refreshData()),
     onSettings: () =>
@@ -174,7 +175,7 @@ function launchMain(root: HTMLElement, sessionKey: string) {
   infoBanner.querySelector('#btn-banner-test-call')?.addEventListener('click', () => {
     callManager.simulateIncomingCall(contacts[0]);
   });
-  appContainer.appendChild(infoBanner);
+  if (IS_DEV) appContainer.appendChild(infoBanner);   // test banner: development builds only
 
   // Tab Navigation Bar
   const tabNav = document.createElement('div');
@@ -330,4 +331,7 @@ function showToast(message: string): void {
   setTimeout(() => toast.remove(), 2600);
 }
 
-document.addEventListener('DOMContentLoaded', initApp);
+document.addEventListener('DOMContentLoaded', () => {
+  // The identity key is decrypted from the vault before anything reads settings.
+  void storage.unlock().then(initApp);
+});

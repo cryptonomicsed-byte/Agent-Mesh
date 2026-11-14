@@ -1,3 +1,4 @@
+import { IS_DEV } from '../env';
 import { AppSettings } from '../types';
 
 export function createHeader(
@@ -105,7 +106,11 @@ export function createHeader(
   `;
 
   // Bind event listeners
-  header.querySelector('#btn-simulate-call')?.addEventListener('click', handlers.onSimulateCall);
+  if (IS_DEV) {
+    header.querySelector('#btn-simulate-call')?.addEventListener('click', handlers.onSimulateCall);
+  } else {
+    header.querySelector('#btn-simulate-call')?.remove();   // no simulated calls in production
+  }
   header.querySelector('#btn-show-my-qr')?.addEventListener('click', handlers.onShowMyQR);
   header.querySelector('#btn-scan-qr')?.addEventListener('click', handlers.onScanQR);
   header.querySelector('#btn-settings')?.addEventListener('click', handlers.onSettings);
