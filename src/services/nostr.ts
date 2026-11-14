@@ -8,14 +8,20 @@
  *   - Inbound: event.pubkey IS the sender (1-layer wrap from agent-voice)
  *   - Inbound 3-layer NIP-17: inner is kind:13 seal → decrypt with seal.pubkey
  *   - Signal payload: {type, call_id, sdp?, candidate?, reason?}
+ *
+ * Nothing is treated as coming from a sender until it is authenticated: the
+ * outer event's id and signature are verified, and for a 3-layer wrap the
+ * seal's too, with the rumor's author required to match the seal signer.
  */
 
 import {
   generateSecretKey,
   getPublicKey,
   finalizeEvent,
+  verifyEvent,
   nip44,
 } from 'nostr-tools';
+import type { Event as NostrEvent } from 'nostr-tools';
 
 export type SecKey = Uint8Array;
 export type PubKeyHex = string; // 64 lowercase hex chars
@@ -65,32 +71,78 @@ export function buildSignalEvent(senderSk: SecKey, recipientPk: PubKeyHex, paylo
   }, senderSk);
 }
 
-// Decrypt a kind:1059 event — handles both 1-layer and 3-layer NIP-17
+/**
+ * Verify an event's id and signature from its wire fields only. nostr-tools
+ * caches a "verified" marker on event objects; copying the plain fields means
+ * a marker carried over from another object can never stand in for a check.
+ */
+function verifyFresh(ev: Record<string, unknown>): boolean {
+  const { id, pubkey, created_at, kind, tags, content, sig } = ev;
+  return verifyEvent({ id, pubkey, created_at, kind, tags, content, sig } as unknown as NostrEvent);
+}
+
+/**
+ * Authenticate and decrypt a kind:1059 event. Handles 1-layer wraps and
+ * 3-layer NIP-17. Throws if any layer fails verification.
+ */
 export function decryptSignalEvent(
-  event: { pubkey: string; content: string },
+  event: Record<string, unknown>,
   ourSk: SecKey,
 ): { plaintext: string; senderPk: PubKeyHex } {
-  // Outer layer: ECDH(our_seckey, event.pubkey)
-  const outerConvKey = nip44.v2.utils.getConversationKey(ourSk, event.pubkey);
-  const outer = nip44.v2.decrypt(event.content, outerConvKey);
+  const ourPk = getPublicKey(ourSk);
+  const tags = Array.isArray(event.tags) ? event.tags as unknown[][] : [];
+  if (!tags.some(t => Array.isArray(t) && t[0] === 'p' && t[1] === ourPk)) {
+    throw new Error('event is not addressed to us');
+  }
+  if (!verifyFresh(event)) {
+    throw new Error('event signature does not verify');
+  }
+  const outerPk = event.pubkey as string;
+  const outer = nip44.v2.decrypt(
+    event.content as string, nip44.v2.utils.getConversationKey(ourSk, outerPk));
 
-  // Probe for 3-layer NIP-17: outer decrypts to a kind:13 seal JSON
-  try {
-    const inner = JSON.parse(outer) as Record<string, unknown>;
-    if (inner?.kind === 13 && typeof inner.pubkey === 'string' && typeof inner.content === 'string') {
-      const sealConvKey = nip44.v2.utils.getConversationKey(ourSk, inner.pubkey as string);
-      const rumorStr = nip44.v2.decrypt(inner.content as string, sealConvKey);
-      const rumor = JSON.parse(rumorStr) as Record<string, unknown>;
-      const content = rumor?.kind === 14 && typeof rumor.content === 'string'
-        ? rumor.content as string
-        : rumorStr;
-      return { plaintext: content, senderPk: inner.pubkey as string };
+  let inner: Record<string, unknown> | null = null;
+  try { inner = JSON.parse(outer) as Record<string, unknown>; } catch { inner = null; }
+
+  if (inner && inner.kind === 13) {
+    // 3-layer NIP-17: the outer key is a throwaway; the seal signer is the sender.
+    if (!verifyFresh(inner)) {
+      throw new Error('seal signature does not verify');
     }
-  } catch {}
+    const sealPk = inner.pubkey as string;
+    const rumor = JSON.parse(nip44.v2.decrypt(
+      inner.content as string, nip44.v2.utils.getConversationKey(ourSk, sealPk),
+    )) as Record<string, unknown>;
+    if (rumor?.kind !== 14 || typeof rumor.content !== 'string') {
+      throw new Error('seal does not contain a kind:14 rumor');
+    }
+    if (rumor.pubkey !== sealPk) {
+      throw new Error('rumor author does not match the seal signer');
+    }
+    return { plaintext: rumor.content, senderPk: sealPk };
+  }
 
   // 1-layer: outer IS the signal JSON (event.pubkey = real sender)
-  return { plaintext: outer, senderPk: event.pubkey };
+  return { plaintext: outer, senderPk: outerPk };
 }
+
+/** NIP-42: the relay URL in an AUTH event is scheme + host, without the proxy path. */
+export function authRelayUrl(url: string): string {
+  const u = new URL(url);
+  return `${u.protocol}//${u.host}`;
+}
+
+/** NIP-42: build the signed kind:22242 reply to a relay's AUTH challenge. */
+export function buildAuthEvent(sk: SecKey, relayUrl: string, challenge: string): NostrEvent {
+  return finalizeEvent({
+    kind: 22242,
+    content: '',
+    tags: [['relay', authRelayUrl(relayUrl)], ['challenge', challenge]],
+    created_at: Math.floor(Date.now() / 1000),
+  }, sk);
+}
+
+export type RelayStatus = 'connecting' | 'connected' | 'auth-rejected' | 'disconnected';
 
 export const DEFAULT_RELAY = 'wss://omokoda.duckdns.org:3443';
 export const FALLBACK_RELAYS = ['wss://relay.damus.io', 'wss://nos.lol'];
@@ -104,6 +156,10 @@ export class NostrRelay {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private signalHandlers: Array<(s: IncomingSignal) => void> = [];
   private statusHandlers: Array<(connected: boolean) => void> = [];
+  private detailHandlers: Array<(status: RelayStatus, reason?: string) => void> = [];
+  private pendingAuthId: string | null = null;
+  private subscribed = false;
+  private seenIds = new Set<string>();
 
   constructor(
     private readonly url: string,
@@ -118,8 +174,28 @@ export class NostrRelay {
     return new NostrRelay(relayUrl ?? DEFAULT_RELAY, sk);
   }
 
+  /** True once the socket is open AND our subscription is live (after AUTH, if the relay demands it). */
   get isConnected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
+    return this.ws?.readyState === WebSocket.OPEN && this.subscribed;
+  }
+
+  /** Detailed status, including a relay that refused our NIP-42 credentials. */
+  onStatusDetail(cb: (status: RelayStatus, reason?: string) => void): () => void {
+    this.detailHandlers.push(cb);
+    return () => { this.detailHandlers = this.detailHandlers.filter(h => h !== cb); };
+  }
+
+  private _setStatus(status: RelayStatus, reason?: string): void {
+    this.detailHandlers.forEach(h => h(status, reason));
+    this.statusHandlers.forEach(h => h(status === 'connected'));
+  }
+
+  private _subscribe(ws: WebSocket): void {
+    const since = Math.floor(Date.now() / 1000) - 300;
+    ws.send(JSON.stringify([
+      'REQ', this.subId,
+      { kinds: [1059], '#p': [this.ourPk], since },
+    ]));
   }
 
   onSignal(cb: (s: IncomingSignal) => void): () => void {
@@ -150,28 +226,52 @@ export class NostrRelay {
       const ws = new WebSocket(this.url);
       this.ws = ws;
 
+      this.subscribed = false;
+      this.pendingAuthId = null;
+      this._setStatus('connecting');
+
       ws.onopen = () => {
         this.reconnectMs = 2000;
-        const since = Math.floor(Date.now() / 1000) - 300;
-        ws.send(JSON.stringify([
-          'REQ', this.subId,
-          { kinds: [1059], '#p': [this.ourPk], since },
-        ]));
-        this.statusHandlers.forEach(h => h(true));
+        this._subscribe(ws);
       };
 
       ws.onmessage = (e: MessageEvent) => {
-        try {
-          const msg = JSON.parse(e.data as string) as unknown[];
-          if (msg[0] === 'EVENT' && msg[1] === this.subId) {
-            this._handleEvent(msg[2] as Record<string, unknown>);
+        let msg: unknown[];
+        try { msg = JSON.parse(e.data as string) as unknown[]; } catch { return; }
+        if (!Array.isArray(msg)) return;
+        if (msg[0] === 'AUTH' && typeof msg[1] === 'string') {
+          // NIP-42: prove who we are, then (re)subscribe once the relay accepts.
+          const auth = buildAuthEvent(this.ourSk, this.url, msg[1]);
+          this.pendingAuthId = auth.id;
+          this.subscribed = false;
+          ws.send(JSON.stringify(['AUTH', auth]));
+        } else if (msg[0] === 'OK' && msg[1] === this.pendingAuthId) {
+          this.pendingAuthId = null;
+          if (msg[2] === true) {
+            this._subscribe(ws);
+          } else {
+            // Retrying with the same key cannot succeed; stop and say why.
+            this.closed = true;
+            this._setStatus('auth-rejected', String(msg[3] ?? ''));
+            ws.close();
           }
-        } catch {}
+        } else if (msg[0] === 'EOSE' && msg[1] === this.subId) {
+          if (!this.subscribed) { this.subscribed = true; this._setStatus('connected'); }
+        } else if (msg[0] === 'CLOSED' && msg[1] === this.subId) {
+          this.subscribed = false;
+          // "auth-required" before our AUTH was accepted is expected; the
+          // subscription is re-issued on OK. Anything else: reconnect.
+          if (!this.pendingAuthId && !String(msg[2] ?? '').startsWith('auth-required')) ws.close();
+        } else if (msg[0] === 'EVENT' && msg[1] === this.subId) {
+          if (!this.subscribed) { this.subscribed = true; this._setStatus('connected'); }
+          this._handleEvent(msg[2] as Record<string, unknown>);
+        }
       };
 
       ws.onerror = () => {};
       ws.onclose = () => {
-        this.statusHandlers.forEach(h => h(false));
+        this.subscribed = false;
+        if (!this.closed) this._setStatus('disconnected');
         if (!this.closed) {
           this.reconnectTimer = setTimeout(() => {
             this.reconnectMs = Math.min(this.reconnectMs * 1.5, 30000);
@@ -183,16 +283,22 @@ export class NostrRelay {
   }
 
   private _handleEvent(event: Record<string, unknown>): void {
-    if (event.kind !== 1059) return;
+    if (event.kind !== 1059 || typeof event.id !== 'string') return;
+    if (this.seenIds.has(event.id)) return;          // replayed on reconnect / second relay
+    let parsed: { plaintext: string; senderPk: PubKeyHex };
     try {
-      const { plaintext, senderPk } = decryptSignalEvent(
-        event as { pubkey: string; content: string },
-        this.ourSk,
-      );
-      const signal = JSON.parse(plaintext) as SignalPayload;
-      if (!signal?.type || !signal?.call_id) return;
-      this.signalHandlers.forEach(h => h({ signal, senderPk }));
-    } catch {}
+      parsed = decryptSignalEvent(event, this.ourSk);
+    } catch (err) {
+      console.warn('[NostrRelay] dropped unauthenticated event:', (err as Error).message);
+      return;
+    }
+    this.seenIds.add(event.id);
+    if (this.seenIds.size > 2000) this.seenIds.delete(this.seenIds.values().next().value as string);
+    let signal: SignalPayload;
+    try { signal = JSON.parse(parsed.plaintext) as SignalPayload; } catch { return; }
+    if (!signal || typeof signal.call_id !== 'string'
+        || !['offer', 'answer', 'ice', 'hangup'].includes(signal.type)) return;
+    this.signalHandlers.forEach(h => h({ signal, senderPk: parsed.senderPk }));
   }
 
   sendSignal(recipientPk: PubKeyHex, signal: SignalPayload): boolean {

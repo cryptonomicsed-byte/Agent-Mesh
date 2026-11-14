@@ -1,3 +1,4 @@
+import { IS_DEV } from '../env';
 import { Contact, ActiveCallState, CallStats, InCallChatMessage, CallEvent } from '../types';
 import { audioSynth } from './audioSynthesizer';
 import { storage } from './storage';
@@ -20,6 +21,10 @@ function randomHex(n = 16): string {
   crypto.getRandomValues(b);
   return Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
 }
+
+
+/** The real microphone could not be opened; the call must not continue. */
+export class MediaUnavailableError extends Error {}
 
 class CallManager {
   // ── state ──────────────────────────────────────────────────────────────
@@ -68,6 +73,11 @@ class CallManager {
       this.relay.onSignal(({ signal, senderPk }) => this._onIncomingSignal(signal, senderPk));
       this.relay.onStatusChange((connected) => {
         this.relayStatusListeners.forEach(cb => cb(connected, this.currentRelayUrl));
+      });
+      this.relay.onStatusDetail((status, reason) => {
+        if (status === 'auth-rejected') {
+          this._showCallError(`The relay refused this identity${reason ? ` (${reason})` : ''}. Calls cannot be placed or received on it.`);
+        }
       });
       this.relay.connect();
       console.info('[CallManager] relay connecting →', this.currentRelayUrl);
@@ -153,15 +163,42 @@ class CallManager {
 
   // ── media ──────────────────────────────────────────────────────────────
 
+  /**
+   * Get the real microphone (and camera). A call never proceeds on made-up
+   * media: if the microphone is unavailable this throws and the call ends
+   * with an explanation. If only the camera is unavailable the call continues
+   * as audio-only and says so.
+   */
   private async acquireMedia(video: boolean): Promise<MediaStream> {
+    if (this.isSimulated) return this._syntheticStream(video, 'Me');
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new MediaUnavailableError('This browser or page cannot access a microphone (HTTPS is required).');
+    }
+    const audio = { audio: true } as const;
+    if (video) {
+      try {
+        return await navigator.mediaDevices.getUserMedia({
+          ...audio,
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+        });
+      } catch (err) {
+        console.warn('[CallManager] camera unavailable, trying audio only', err);
+      }
+    }
     try {
-      return await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: video ? { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' } : false,
-      });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      if (video) {
+        this.hasVideo = false;
+        this.isCameraOff = true;
+        this._showCallError('Camera unavailable — continuing as an audio call.');
+      }
+      return stream;
     } catch (err) {
-      console.warn('[CallManager] real media unavailable, using synthetic stream', err);
-      return this._syntheticStream(video, 'Me');
+      const name = (err as DOMException)?.name;
+      throw new MediaUnavailableError(
+        name === 'NotAllowedError' ? 'Microphone permission was denied. Allow microphone access to make calls.'
+          : name === 'NotFoundError' ? 'No microphone was found.'
+            : 'The microphone could not be opened.');
     }
   }
 
@@ -406,6 +443,7 @@ class CallManager {
       }, 60_000);
     } catch (err) {
       console.error('[CallManager] startCall error:', err);
+      if (err instanceof MediaUnavailableError) this._showCallError(err.message);
       this.endCall('outgoing_error');
     }
   }
@@ -450,6 +488,7 @@ class CallManager {
       // Connected state fires from pc.ontrack when remote tracks arrive
     } catch (err) {
       console.error('[CallManager] acceptCall error:', err);
+      if (err instanceof MediaUnavailableError) this._showCallError(err.message);
       this.endCall('incoming_error');
     }
   }
@@ -596,7 +635,7 @@ class CallManager {
         return;
       } catch {}
     }
-    // Simulated stats fallback
+    if (!this.isSimulated) return;      // never show invented numbers for a real call
     this.statsListeners.forEach(cb => cb({
       resolution: this.hasVideo ? '1280×720 (sim)' : 'Audio Only (sim)',
       frameRate: this.hasVideo ? 30 : 0,
@@ -612,6 +651,7 @@ class CallManager {
 
   /** Simulate an incoming call without Nostr — useful for UI testing. */
   simulateIncomingCall(customContact?: Contact): void {
+    if (!IS_DEV) return;                 // development builds only
     if (this.currentState !== 'idle') return;
 
     const contact = customContact ?? storage.getContacts()[0] ?? {

@@ -1,6 +1,7 @@
 import { Contact, CallEvent, AppSettings } from '../types';
 import { generateIdentityKeyPairSync, derivePublicKey } from './crypto';
 import { DEFAULT_RELAY } from './nostr';
+import { loadPrivateKey, savePrivateKey, vaultAvailable } from './keyVault';
 
 const CONTACTS_STORAGE_KEY = 'meshenger_contacts_v1';
 const EVENTS_STORAGE_KEY = 'meshenger_events_v1';
@@ -39,15 +40,58 @@ const SEED_CONTACTS: Contact[] = [
 const SEED_EVENTS: CallEvent[] = [];
 
 class StorageService {
+  /** The identity secret key, held in memory once unlock() has run. */
+  private privateKey: string | null = null;
+  private useVault = false;
+
+  /**
+   * Load the identity key from the encrypted vault. Call once before anything
+   * reads settings. A key left in localStorage by an older version is moved
+   * into the vault and removed from localStorage.
+   */
+  async unlock(): Promise<void> {
+    if (!vaultAvailable()) {
+      console.warn('[storage] WebCrypto/IndexedDB unavailable; identity key stays in localStorage');
+      return;
+    }
+    try {
+      this.privateKey = await loadPrivateKey();
+      const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+      const legacy = raw ? (JSON.parse(raw) as Partial<AppSettings>) : null;
+      if (legacy?.privateKey) {
+        if (!this.privateKey) {
+          await savePrivateKey(legacy.privateKey);
+          this.privateKey = legacy.privateKey;
+        }
+        delete legacy.privateKey;
+        localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(legacy));
+      }
+      this.useVault = true;
+    } catch (err) {
+      console.warn('[storage] key vault failed; identity key stays in localStorage', err);
+    }
+  }
+
   getSettings(): AppSettings {
     const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
     if (!raw) {
       const defaults = makeDefaultSettings();
+      if (this.privateKey) {               // settings were cleared but the identity survives
+        defaults.privateKey = this.privateKey;
+        defaults.publicKey = derivePublicKey(this.privateKey);
+      }
       this.saveSettings(defaults);
       return defaults;
     }
     try {
       const stored = JSON.parse(raw) as AppSettings;
+      if (this.useVault) {
+        if (!this.privateKey) {            // vault was wiped: this identity is gone, mint a new one
+          this.privateKey = generateIdentityKeyPairSync().privateKey;
+          void savePrivateKey(this.privateKey).catch(e => console.warn('[storage] vault write failed', e));
+        }
+        stored.privateKey = this.privateKey;
+      }
       // Ensure secp256k1 public key is consistent with stored private key
       if (stored.privateKey?.length === 64) {
         try { stored.publicKey = derivePublicKey(stored.privateKey); } catch {}
@@ -66,7 +110,17 @@ class StorageService {
   }
 
   saveSettings(settings: AppSettings): void {
-    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    if (!this.useVault) {
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+      return;
+    }
+    if (settings.privateKey && settings.privateKey !== this.privateKey) {
+      this.privateKey = settings.privateKey;
+      void savePrivateKey(settings.privateKey).catch(e => console.warn('[storage] vault write failed', e));
+    }
+    // The secret key never goes to localStorage.
+    const { privateKey: _omit, ...rest } = settings;
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(rest));
   }
 
   getContacts(): Contact[] {
